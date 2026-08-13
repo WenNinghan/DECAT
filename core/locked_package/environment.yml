@@ -1,0 +1,21 @@
+name: decat
+channels:
+  - conda-forge
+  - pytorch
+dependencies:
+  - python=3.10
+  - numpy
+  - pandas
+  - scikit-learn
+  - scipy
+  - matplotlib
+  - seaborn
+  - pytorch
+  - rdkit
+  - pip
+  - pip:
+      - scikit-optimize
+      - xgboost
+      - bayesian-optimization
+      - shap
+

@@ -1,0 +1,26 @@
+{
+  "route": "SEEN25-1626 seed-242 locked",
+  "train_n": 1240,
+  "fp_bits": 3147,
+  "topk_features": 914,
+  "feature_selection": {
+    "estimator": "RandomForestRegressor",
+    "n_estimators": 240,
+    "random_state": 42,
+    "fit_scope": "training split only"
+  },
+  "distance": {
+    "metric": "1 - nearest-neighbour Tanimoto similarity",
+    "strict_q95_distance": 0.6428571428571428,
+    "borderline_q99_distance": 0.8
+  },
+  "training_pH_range": [1.0, 12.0],
+  "unique_library_size": 4295,
+  "row_library_size": 11654,
+  "outputs": {
+    "unique": "../results/AD_seed242_unique_compound_results.csv",
+    "row_level": "../results/AD_seed242_row_level_results.csv",
+    "summary": "../results/AD_seed242_summary.json"
+  }
+}
+

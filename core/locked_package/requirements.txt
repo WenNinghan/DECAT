@@ -1,0 +1,13 @@
+torch
+numpy
+pandas
+scikit-learn
+scikit-optimize
+scipy
+rdkit-pypi
+matplotlib
+seaborn
+xgboost
+bayesian-optimization
+shap
+

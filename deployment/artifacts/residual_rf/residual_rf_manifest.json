@@ -1,0 +1,7 @@
+{
+  "files": [
+    "residual_rf_seed90.pkl"
+  ],
+  "seed_base": 90,
+  "repeats": 1
+}

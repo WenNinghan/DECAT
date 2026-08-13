@@ -1,0 +1,185 @@
+{
+  "n_files": 36,
+  "files": [
+    {
+      "path": "artifacts/predictions/fusion_components.npz",
+      "bytes": 107292,
+      "sha256": "48f36ef0e0a7f8925513df9272a5c1e00ecd5c6de8eaa402b74dc3a1e614ea00"
+    },
+    {
+      "path": "artifacts/predictions/validation_predictions.npz",
+      "bytes": 11587,
+      "sha256": "8134d0846428251ca40fe1d9d5c93a355fc7d730bb7f5099c6718f0e440a0900"
+    },
+    {
+      "path": "artifacts/run/25class_training_contract.json",
+      "bytes": 4210,
+      "sha256": "f51536a5ad4c2febf963d701f45e0c2bfa7b7099cfab38f7288c74b6784f29af"
+    },
+    {
+      "path": "artifacts/run/best_params.json",
+      "bytes": 1392,
+      "sha256": "37d9a471f9d973d6fb5512aac92f0b9c718927527f3a94def10a19400145b5c0"
+    },
+    {
+      "path": "artifacts/run/fixed_params_run_summary.json",
+      "bytes": 5981,
+      "sha256": "39b7f3f51299ce11218a31caad7f412681a6aef49d245a095207185db13cac84"
+    },
+    {
+      "path": "artifacts/run/iter1_fp3147_k914_Dual_attn_cls_by_category.pdf",
+      "bytes": 17557,
+      "sha256": "8914fc99ddb89c4390dfb2dc4d9937a38a6a8020699c2cfaed7bd9d4056e8518"
+    },
+    {
+      "path": "artifacts/run/iter1_fp3147_k914_Dual_attn_cls_by_category.png",
+      "bytes": 217157,
+      "sha256": "1e864a14db95f353512a03a8a762f68207c3f0e30917f4b01b13f69a295229a3"
+    },
+    {
+      "path": "artifacts/run/iter1_fp3147_k914_Dual_feature_corr_network_top20.pdf",
+      "bytes": 68824,
+      "sha256": "76b13462ca769ffa84001708a46edab7889ef36fefca0e094617235fcb626121"
+    },
+    {
+      "path": "artifacts/run/iter1_fp3147_k914_Dual_feature_corr_network_top20.png",
+      "bytes": 1644787,
+      "sha256": "288953fb6ae7c67d622967def8a180b0c6562f0698ba7de85ac482aad84a7c38"
+    },
+    {
+      "path": "artifacts/run/iter1_fp3147_k914_Dual_train_density_test_overlay.pdf",
+      "bytes": 85994,
+      "sha256": "2bcce329d05e309332ddf5e54895ae649bd5c411785ea918443ad451dfe03104"
+    },
+    {
+      "path": "artifacts/run/iter1_fp3147_k914_Dual_train_density_test_overlay.png",
+      "bytes": 506134,
+      "sha256": "ac586348370029d531bb6648e519b101937959b67facc2d3407dd4d7f654c271"
+    },
+    {
+      "path": "artifacts/run/iter1_fp3147_k914_Dual_train_test_vs_true_band.pdf",
+      "bytes": 85994,
+      "sha256": "5be2cc95436c5fb127b6ea935e20d8dda1e029524e13a96dc11d4f7926a73fb1"
+    },
+    {
+      "path": "artifacts/run/iter1_fp3147_k914_Dual_train_test_vs_true_band.png",
+      "bytes": 506134,
+      "sha256": "ac586348370029d531bb6648e519b101937959b67facc2d3407dd4d7f654c271"
+    },
+    {
+      "path": "artifacts/run/transformer_v7_best.pth",
+      "bytes": 7622902,
+      "sha256": "78e13df70d2c570372b0d9d0a3926541e0bd1821161e5033b3920108d197ca81"
+    },
+    {
+      "path": "configs/LOCKED_SEEN25_1626_NONUNIFORM_SOTA.json",
+      "bytes": 4455,
+      "sha256": "19611cc3c0d03c2c8685ce6c33a4c48916c12149b06ab04e5463d130b4e0c765"
+    },
+    {
+      "path": "configs/V14_1637_validation_topk5.json",
+      "bytes": 3887,
+      "sha256": "3a0efc111c9e65020474f92baf7d4c5fd5f3c0c33f86ff25ddb5332413ce7414"
+    },
+    {
+      "path": "data/反应logk指纹数据_25类_含环境无机物_Other_1626条.csv",
+      "bytes": 14429396,
+      "sha256": "72dfb269c9ffdf95df0d0ea079c8a87e2d74223e544c1bbb5e12f1c966ef5c9d"
+    },
+    {
+      "path": "data/固定划分_1626_同分子异pH非均分_75-12.5-12.5.json",
+      "bytes": 23877,
+      "sha256": "67b670d7d7639c54bc3dc4b3d8d5164e0f7b000c0e01af1a52cb03b92006734c"
+    },
+    {
+      "path": "docs/PERFORMANCE_REPORT.md",
+      "bytes": 2976,
+      "sha256": "ddaae6755396a75542b6d2aa180bce9a6feaa844961089364470979da88284d0"
+    },
+    {
+      "path": "environment.yml",
+      "bytes": 278,
+      "sha256": "ebca69af9294da887ed4fb5fabb58f390d7cc0e295716f8930e027b010145296"
+    },
+    {
+      "path": "metrics/component_performance.csv",
+      "bytes": 861,
+      "sha256": "9da69bcda9dd6cf5ad1285701a422ef9a64d5fc668b1d585df042e5a68b03d80"
+    },
+    {
+      "path": "metrics/detailed_performance.json",
+      "bytes": 16425,
+      "sha256": "1788fcd2ffc80d3b4313ba2e9d082e1c703ca9a1df128ec81069061d32517ba3"
+    },
+    {
+      "path": "metrics/performance_overview.csv",
+      "bytes": 462,
+      "sha256": "338c84e83fcedd507ad7568bda924bb2d751aefcd3633310869ac6b6b956e785"
+    },
+    {
+      "path": "metrics/PERFORMANCE_REPORT.md",
+      "bytes": 2976,
+      "sha256": "ddaae6755396a75542b6d2aa180bce9a6feaa844961089364470979da88284d0"
+    },
+    {
+      "path": "metrics/predictions_test.csv",
+      "bytes": 17275,
+      "sha256": "01ae47470bd8015a95fc65b53dec401a9c0bce87ae663834f0857738881a2f62"
+    },
+    {
+      "path": "metrics/predictions_train.csv",
+      "bytes": 108936,
+      "sha256": "df99f13d4d77e8d83d4f076dbedca14d2ac8cf11a45f94edb9b6e8fbe785016e"
+    },
+    {
+      "path": "metrics/predictions_validation.csv",
+      "bytes": 17056,
+      "sha256": "87201e0d418b77cfd78e8fae7740782287e13e8885ffbf7a4c0f910fc500be6b"
+    },
+    {
+      "path": "README.md",
+      "bytes": 4050,
+      "sha256": "de5d2b831476717a1f72453007c0719961a9c098f473896e334c2177135da9ee"
+    },
+    {
+      "path": "requirements.txt",
+      "bytes": 120,
+      "sha256": "5b6454984e1459e6dea8d3e1169b2dcf8475b057d3e41cc521e3d657ef8890af"
+    },
+    {
+      "path": "run_decat_v21_blind_validation_fixed.py",
+      "bytes": 36020,
+      "sha256": "953d984b80cf7fb37c312bfed47f1397dcee43146181ff0abab81b4315c9d6f0"
+    },
+    {
+      "path": "scripts/_repro_launch.py",
+      "bytes": 2579,
+      "sha256": "8b93201c5d7027f3ecd9033d55d9570888c1f1cc010a491de3dbcf3b25c91f57"
+    },
+    {
+      "path": "scripts/run_locked_seen25_1626.ps1",
+      "bytes": 6839,
+      "sha256": "3952642dd5d902d1a40464d6fcba95476b98c9c5713a139d49ea3d6b9b28f2e7"
+    },
+    {
+      "path": "src/decat/__init__.py",
+      "bytes": 134,
+      "sha256": "20c9892283ad7c9887a16c6756e3bb101444a9b525c1e608f9ebcd885469b0b8"
+    },
+    {
+      "path": "src/decat/__main__.py",
+      "bytes": 81,
+      "sha256": "2cdd23d4f5cd6c3b3e4cb690ad16d560637767b9ca5b2a3cf129fcc0a5ebc82b"
+    },
+    {
+      "path": "src/decat/cli.py",
+      "bytes": 7338,
+      "sha256": "f8a893c9cfc8ba79aac2fe23def76836ae37c306d41f14f874f5b66ff3a9d10e"
+    },
+    {
+      "path": "src/decat/transformer_v9_transformer_centered.py",
+      "bytes": 438055,
+      "sha256": "85dc1bc6c1a572fe3e64ca5181b5b27e85db2b4b8054e32683f499db3227780d"
+    }
+  ]
+}

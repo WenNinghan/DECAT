@@ -1,0 +1,41 @@
+{
+  "route": "SEEN25-1626 seed-242 (locked) vs old V9 (1696, seed-42, top-1100)",
+  "train_n": 1240,
+  "fp_bits": 3147,
+  "topk_features": 914,
+  "rf": {
+    "n_estimators": 240,
+    "random_state": 42
+  },
+  "train_pH_range": [
+    1.0,
+    12.0
+  ],
+  "strict_distance_q95": 0.6428571428571428,
+  "borderline_distance_q99": 0.8,
+  "unique_total": 4295,
+  "unique_counts_seed242": {
+    "In AD": 3423,
+    "Borderline": 699,
+    "Out of DECAT scope - inorganic/no carbon": 82,
+    "Out of AD": 51,
+    "Out of AD - pH outside train range": 40
+  },
+  "unique_counts_old_v9": {
+    "In AD": 3468,
+    "Borderline": 676,
+    "Out of AD": 61,
+    "Out of DECAT scope - inorganic/no carbon": 82,
+    "Out of AD - pH outside train range": 8
+  },
+  "in_ad_percent_seed242": 79.7,
+  "row_total": 11654,
+  "row_counts_seed242": {
+    "In AD": 9764,
+    "Borderline": 1017,
+    "Out of AD - pH outside train range": 309,
+    "Out of DECAT scope - inorganic/no carbon": 235,
+    "Out of AD": 64
+  },
+  "runtime_sec": 11.7
+}
