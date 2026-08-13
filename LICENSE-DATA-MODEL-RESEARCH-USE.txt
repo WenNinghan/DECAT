@@ -1,0 +1,40 @@
+DECAT data, model weights and derived screening results
+Research-use terms for release v1.0.2
+
+Copyright (c) 2026 DECAT authors
+
+1. Scope
+
+These terms apply only to the author-created portions of the DECAT release,
+including the model weights, derived predictions, derived applicability-domain
+labels and other author-created data or artifacts identified in the repository.
+They do not replace or override any rights, restrictions or attribution
+requirements that apply to third-party data, source records, identifiers or
+other material included in the release.
+
+2. Permission
+
+Subject to these terms and the applicable third-party terms, the author-created
+materials may be downloaded, used, reproduced and modified for non-commercial
+research, education, reproducibility and internal model evaluation.
+
+3. Conditions
+
+Users must:
+
+- cite the DECAT manuscript and the version of this release used;
+- retain this notice and the relevant source acknowledgements;
+- identify material modifications to the model, data or derived results; and
+- verify that their intended use is compatible with the terms governing every
+  bundled third-party record or source.
+
+Commercial licensing, resale of the bundled materials, or redistribution of
+third-party material is not granted by these terms. Requests concerning uses
+outside the scope above should be directed to the DECAT authors.
+
+4. No warranty
+
+The materials are provided for research purposes without warranties of any
+kind. Predictions and applicability-domain labels must not be used as the sole
+basis for clinical, safety, regulatory, environmental-compliance or other
+high-consequence decisions.
