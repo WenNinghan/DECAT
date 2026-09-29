@@ -12,9 +12,7 @@
 
 ## Provenance and missing references
 
-This workbook presents the five study-data fields without molecular descriptors or fingerprint columns. Records retain their original order and identifiers. Experimental log k and pH values agree with the corresponding records in the locked 1,626-record dataset. Reference values were transferred from the original `Ref` field by record identifier.
-
-Source identifiers are present for 1,624 records. The original reference field is empty for `NO. 345` (`(CH3)2NCl`) and `NO. 1098` (`H2S`). Their cells read `Not provided in original dataset`; no citation has been inferred or assigned to those records.
+This workbook presents the five study-data fields without molecular descriptors or fingerprint columns. Records retain their original order and identifiers. Experimental log k and pH values agree with the corresponding records in the  1,626-record dataset. 
 
 The workbook is the public study-data download from v1.0.3 onward. The fingerprint-enriched CSV files under `core/locked_package/data/` and `deployment/artifacts/runtime_package/data/` remain the processed inputs required by the locked training and inference workflows. Those feature files and the model artifacts are unchanged by this data-table update.
 
