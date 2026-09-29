@@ -1,6 +1,6 @@
 {
   "title": "DECAT: dual-expert chemistry-aware Transformer for ozone-pollutant reaction kinetics",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "upload_type": "software",
   "access_right": "open",
   "language": "eng",
@@ -15,7 +15,7 @@
     "applicability domain",
     "water treatment"
   ],
-  "description": "DECAT is a reproducibility and deployment package for predicting second-order reaction rate constants between ozone and environmental pollutants. It contains the locked 1,626-record, 25-class workflow; the two-layer, four-head Post-LN dual-expert Transformer; the Top-3 validation-ranked checkpoint ensemble; the validation-selected nn_plus_res_rf correction head; a self-contained Streamlit prediction platform; and the seed-242 applicability-domain screening workflow with results for 4,295 unique external structures. The package does not retrain the model. The original third-party paper PDFs are intentionally excluded. The source code is distributed under the MIT License. Data, model weights and derived screening outputs are accompanied by the DECAT research-use terms in LICENSE-DATA-MODEL-RESEARCH-USE.txt; third-party materials remain subject to their original terms.",
+  "description": "DECAT is a reproducibility and deployment package for predicting second-order reaction rate constants between ozone and environmental pollutants. It contains the locked 1,626-record, 25-class workflow; the two-layer, four-head Post-LN dual-expert Transformer; the Top-3 validation-ranked checkpoint ensemble; the validation-selected nn_plus_res_rf correction head; a self-contained Streamlit prediction platform; and the seed-242 applicability-domain screening workflow with results for 4,295 unique external structures. The package does not retrain the model. The original third-party paper PDFs are intentionally excluded. The source code is distributed under the MIT License. Data, model weights and derived screening outputs are accompanied by the DECAT research-use terms in LICENSE-DATA-MODEL-RESEARCH-USE.txt; third-party materials remain subject to their original terms. Release 1.0.3 adds the current public study-data workbook with 1,626 records and the columns NO., Compounds, log k, pH and Reference. The workbook preserves the existing experimental values and record identifiers; two originally missing source references are explicitly marked. The processed fingerprint inputs, model artifacts and locked inference workflow are unchanged.",
   "creators": [
     {
       "name": "Zhang, Guosen",

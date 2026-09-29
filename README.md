@@ -2,8 +2,15 @@
 
 This release packages the locked DECAT route used for the manuscript together with the Streamlit deployment and the seed-242 applicability-domain screen.
 
+## Study dataset
+
+Download the current [DECAT dataset with references](data/DECAT_Dataset_with_References.xlsx). The workbook contains 1,626 records and five columns: `NO.`, `Compounds`, `log k`, `pH`, and `Reference`. It is the public data table for this study from v1.0.3 onward. See the [data dictionary and provenance notes](data/README.md) for column definitions and the two records whose original reference field is missing.
+
+The fingerprint-enriched CSV files under `core/locked_package/` and `deployment/` remain the processed inputs required by the locked model. The updated workbook preserves their record identifiers, experimental values, and pH values; it does not replace the feature matrices used by the executable workflows.
+
 ## Contents
 
+- `data/`: the current study dataset in Excel format, with source references and a data dictionary.
 - `core/locked_package/`: the public, portable copy of the locked reproduction package for the 1,626-record, 25-class dataset. The original locked source package is preserved separately by the authors.
 - `deployment/`: self-contained Streamlit platform, Top-3 validation-ranked checkpoints, serialized `nn_plus_res_rf` residual model, runtime code, the 1,626-record reference data, and the ten published external-validation cases.
 - `screening/`: seed-242 AD script, the 4,295-structure input library, the 11,654-row source table, and the resulting unique-structure and row-level labels.
