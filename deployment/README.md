@@ -12,6 +12,8 @@
 
 The requirements are pinned to the validated model environment. The Linux x86_64 / Python 3.13 target uses an official CPU-only PyTorch wheel; `rdkit` replaces the obsolete `rdkit-pypi` distribution. Keep `scikit-learn==1.7.2` to match the serialized residual model.
 
+The repository-root `packages.txt` supplies `libxrender1` and `libxext6` for RDKit's Cairo drawing backend; these packages also install `libx11-6` as a dependency. These Linux shared libraries are not included in the RDKit wheel and are needed when importing `rdkit.Chem.Draw`. Community Cloud installs them with apt before starting the app.
+
 Do not deploy this environment with Python 3.14. If an existing deployment uses 3.14, Community Cloud requires deleting that failed app instance and redeploying it with Python 3.13 selected in Advanced settings. Reuse the same repository, entrypoint, and custom subdomain. Rebooting the existing instance does not change its Python version. See the [Community Cloud Python-version instructions](https://docs.streamlit.io/deploy/streamlit-community-cloud/manage-your-app/upgrade-python).
 
 ## Local launch
