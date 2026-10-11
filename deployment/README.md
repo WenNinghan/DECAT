@@ -16,6 +16,24 @@ The repository-root `packages.txt` supplies `libxrender1` and `libxext6` for RDK
 
 Do not deploy this environment with Python 3.14. If an existing deployment uses 3.14, Community Cloud requires deleting that failed app instance and redeploying it with Python 3.13 selected in Advanced settings. Reuse the same repository, entrypoint, and custom subdomain. Rebooting the existing instance does not change its Python version. See the [Community Cloud Python-version instructions](https://docs.streamlit.io/deploy/streamlit-community-cloud/manage-your-app/upgrade-python).
 
+## Scheduled public-app activation
+
+The [Activate DECAT app workflow](https://github.com/WenNinghan/DECAT/actions/workflows/activate-app.yml) visits <https://decat-ozone.streamlit.app/> every six hours (02:17, 08:17, 14:17 and 20:17 Beijing time). It also supports **Run workflow** for an immediate manual check. Execution happens on GitHub runners and does not require the author's computer to stay on.
+
+The independent `maintenance/activate_app.py` script opens an anonymous Chromium session, clicks the official wake-up button if present, and waits for the DECAT heading, chemical-name input and prediction button in the actual app frame. It does not run predictions. An HTTP 200 response alone is not counted as success. Each run saves a JSON report and screenshots as a seven-day Actions artifact; an unsuccessful check exits nonzero.
+
+To run it yourself in a separate Python environment:
+
+```shell
+python -m pip install -r maintenance/requirements.txt
+python -m playwright install --only-shell chromium
+python maintenance/activate_app.py --output-dir activation-results
+```
+
+On Linux, use `python -m playwright install --with-deps --only-shell chromium` to install the browser's system dependencies as well. These maintenance dependencies are separate from the prediction app's pinned environment.
+
+Streamlit's [current hibernation rule](https://docs.streamlit.io/deploy/streamlit-community-cloud/manage-your-app#app-hibernation) is 12 hours without traffic. This workflow is a best-effort visit and wake-up check, not an uptime guarantee. GitHub scheduled jobs can be delayed or dropped, and [public repositories with no activity for 60 days have their schedules disabled](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule). Re-enable the workflow from Actions if that happens. To stop the visits, select **Disable workflow** from its Actions menu.
+
 ## Local launch
 
 Run from the release root:
