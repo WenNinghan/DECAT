@@ -2,6 +2,18 @@
 
 DECAT includes training and prediction source, pretrained weights, the original experimental dataset, and a [Streamlit app](https://decat-ozone.streamlit.app/).
 
+## Authors
+
+Guosen Zhang<sup>a,b,1</sup>, Ninghan Wen<sup>a,1</sup>, Chaosen Yang<sup>b</sup>, Jinqi Jiang<sup>a,b</sup>, Haorao Chen<sup>b</sup>, Yiwen Tang<sup>a</sup>, Lei Wang<sup>a</sup>, Pengchao Xie<sup>b,*</sup>, Xueming Liu<sup>a,*</sup>
+
+<sup>a</sup> School of Artificial Intelligence and Automation, Institute of Medical Equipment Science and Engineering, Huazhong University of Science and Technology, Wuhan 430074, China
+
+<sup>b</sup> Institute of Artificial Intelligence, Hubei Key Laboratory of Multi-media Pollution Cooperative Control in Yangtze Basin, Key Laboratory of Water & Wastewater Treatment (MOHURD), Hubei Provincial Engineering Research Center for Water Quality Safety and Pollution Control, Huazhong University of Science and Technology, Wuhan 430074, China
+
+<sup>1</sup> Guosen Zhang and Ninghan Wen contributed equally to this work.
+
+<sup>*</sup> Corresponding authors: Xueming Liu (xm_liu@hust.edu.cn); Pengchao Xie (pengchao_xie@hust.edu.cn).
+
 ## Run
 
 Use Python 3.13. From the repository root:
