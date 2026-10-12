@@ -1,4 +1,4 @@
-"""Validate the package and launch the canonical fixed-parameter DECAT runner."""
+"""Validate the original workbook and launch DECAT with supplied molecular inputs."""
 
 from __future__ import annotations
 
@@ -11,10 +11,9 @@ import sys
 
 
 def verify_package(package_root: Path, config: dict) -> None:
-    """Check required files and the fixed dataset/split contract without importing ML libraries."""
+    """Check original data and source integrity without importing ML libraries."""
     checks = [
         ("data", package_root / config["data"]["path"], config["data"]["sha256"]),
-        ("split", package_root / config["split"]["path"], config["split"]["sha256"]),
     ]
     sources = config["runtime"]["source_files"]
     if not sources:
@@ -31,24 +30,6 @@ def verify_package(package_root: Path, config: dict) -> None:
             raise ValueError(
                 f"{label} SHA-256 mismatch: expected {expected}, got {actual}"
             )
-    split = json.loads(checks[1][1].read_text(encoding="utf-8-sig"))
-    if split["source_sha256"] != config["data"]["sha256"]:
-        raise ValueError("Split source SHA-256 does not match the dataset.")
-    members = [
-        list(map(int, split[key])) for key in ("train_idx", "val_idx", "test_idx")
-    ]
-    expected_sizes = [
-        config["split"][key] for key in ("train_n", "validation_n", "test_n")
-    ]
-    if [len(part) for part in members] != expected_sizes:
-        raise ValueError("Split sizes do not match the configuration.")
-    flattened = [index for part in members for index in part]
-    if len(flattened) != len(set(flattened)) or set(flattened) != set(
-        range(config["data"]["row_count"])
-    ):
-        raise ValueError(
-            "Split members must be disjoint and cover every dataset row once."
-        )
     print("Package integrity OK.", flush=True)
 
 
@@ -57,7 +38,12 @@ def main() -> None:
     parser.add_argument(
         "--verify-only",
         action="store_true",
-        help="Validate files and split membership without training.",
+        help="Validate the package; also prepare and validate --inputs when supplied.",
+    )
+    parser.add_argument(
+        "--inputs",
+        type=Path,
+        help="UTF-8 CSV with NO., SMILES, category27_label and optional CAS; required for training.",
     )
     parser.add_argument(
         "--output-root", type=Path, help="Directory for local training outputs."
@@ -67,27 +53,35 @@ def main() -> None:
     config_path = package_root / "configs" / "decat.json"
     config = json.loads(config_path.read_text(encoding="utf-8-sig"))
     verify_package(package_root, config)
-    if args.verify_only:
-        return
-
     for key, value in config["environment"].items():
         os.environ.setdefault(key, str(value))
-    os.environ.setdefault(
-        "DECAT_DATA_PATH_OVERRIDE", str(package_root / config["data"]["path"])
+    if not args.inputs:
+        if args.verify_only:
+            return
+        parser.error("Training requires --inputs with structures and category labels.")
+    output_root = (
+        args.output_root.resolve()
+        if args.output_root
+        else package_root / "outputs" / "training"
     )
-    os.environ.setdefault(
-        "DECAT_SPLIT_PATH_OVERRIDE", str(package_root / config["split"]["path"])
+    sys.path.insert(0, str(package_root / "src"))
+    from decat.data.inputs import prepare_training_inputs
+
+    data_path, split_path = prepare_training_inputs(
+        (package_root / config["data"]["path"]).resolve(),
+        args.inputs.resolve(),
+        output_root,
+        search_seeds=int(config["split"]["search_seeds"]),
     )
+    print(f"Training inputs and split prepared in {data_path.parent}", flush=True)
+    if args.verify_only:
+        return
+    os.environ["DECAT_DATA_PATH_OVERRIDE"] = str(data_path)
+    os.environ["DECAT_SPLIT_PATH_OVERRIDE"] = str(split_path)
     os.environ.setdefault("DECAT_PARAMS_JSON", json.dumps(config["params"]))
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
-    if args.output_root:
-        os.environ["DECAT_OUTPUT_ROOT_OVERRIDE"] = str(args.output_root.resolve())
-    else:
-        os.environ.setdefault(
-            "DECAT_OUTPUT_ROOT_OVERRIDE", str(package_root / "outputs" / "training")
-        )
+    os.environ["DECAT_OUTPUT_ROOT_OVERRIDE"] = str(output_root)
 
-    sys.path.insert(0, str(package_root / "src"))
     sys.path.insert(0, str(package_root))
     os.chdir(package_root)
     from decat.training.protocol import main as run_training

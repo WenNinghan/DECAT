@@ -12,6 +12,7 @@ from typing import Optional, Dict, List, Tuple
 from html import escape
 
 import numpy as np
+import pandas as pd
 import streamlit as st
 from rdkit import Chem, RDLogger
 from rdkit.Chem import Draw
@@ -21,8 +22,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 RELEASE_ROOT = SCRIPT_DIR.parent
 RUNTIME_PACKAGE = RELEASE_ROOT / "core" / "locked_package"
 RUNTIME_CONFIG_PATH = RUNTIME_PACKAGE / "configs" / "decat.json"
-RUNTIME_DATASET_PATH = RUNTIME_PACKAGE / "data" / "decat_features_1626.csv"
-RUNTIME_SPLIT_PATH = RUNTIME_PACKAGE / "data" / "split.json"
+RUNTIME_REFERENCE_PATH = RUNTIME_PACKAGE / "configs" / "preprocessing.json"
 DEPLOYMENT_ARTIFACTS = SCRIPT_DIR / "artifacts"
 CATEGORY_OVERRIDES_PATH = SCRIPT_DIR / "data" / "category_overrides.csv"
 PACKAGE_SOURCE = RUNTIME_PACKAGE / "src"
@@ -84,11 +84,12 @@ def classify_category27_from_smiles(smiles, manual_input=None):
 
 
 @st.cache_data(ttl=3600)
-def load_reference_dataset(dataset_path=None):
+def load_reference_dataset(config_path=None):
     try:
-        return input_chemistry.load_reference_dataset(
-            dataset_path or str(RUNTIME_DATASET_PATH)
+        config = json.loads(
+            Path(config_path or RUNTIME_REFERENCE_PATH).read_text(encoding="utf-8")
         )
+        return pd.DataFrame(config["compound_lookup"])
     except Exception as error:
         st.warning(f"Reference dataset loading failed: {error}")
         return None
@@ -1084,12 +1085,12 @@ def main():
     )
     inject_custom_styles()
 
-    reference_dataset_path = str(RUNTIME_DATASET_PATH)
+    reference_dataset_path = str(RUNTIME_REFERENCE_PATH)
 
     render_hero(dataset_ready=os.path.exists(reference_dataset_path))
     if not os.path.exists(reference_dataset_path):
         render_alert_banner(
-            "The reference dataset is unavailable. Restore the dataset before running a prediction.",
+            "The model runtime configuration is unavailable. Restore it before running a prediction.",
             tone="error",
         )
 

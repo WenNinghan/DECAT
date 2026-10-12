@@ -1,4 +1,4 @@
-"""Canonical fixed-split training protocol and explicit selection/masking hooks."""
+"""Canonical training protocol for generated inputs and explicit masking hooks."""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ from rdkit import Chem
 
 PROJECT = Path(__file__).resolve().parents[3]
 BASE_CONFIG_PATH = PROJECT / "configs" / "runtime.json"
-SPLIT_PATH = PROJECT / "data" / "split.json"
 
 PARAMS = {
     "fp_bits": 3147,
@@ -594,19 +593,19 @@ def main() -> None:
     seed = os.environ.get("DECAT_STRICT_SEED", "42")
     model_seed = os.environ.get("DECAT_MODEL_SEED", seed)
     split_override = os.environ.get("DECAT_SPLIT_PATH_OVERRIDE", "").strip()
-    split_path = Path(split_override).resolve() if split_override else SPLIT_PATH
+    data_override = os.environ.get("DECAT_DATA_PATH_OVERRIDE", "").strip()
+    if not split_override or not data_override:
+        raise ValueError(
+            "Launch train.py --inputs <csv> to prepare training inputs and a split."
+        )
+    split_path = Path(split_override).resolve()
     if not split_path.is_file():
-        raise FileNotFoundError(f"Fixed split file not found: {split_path}")
+        raise FileNotFoundError(f"Generated split file not found: {split_path}")
     split_metadata = json.loads(split_path.read_text(encoding="utf-8-sig"))
     natural_condition_group = bool(
         split_metadata.get("valid_for_natural_condition_interpolation", False)
     )
-    data_override = os.environ.get("DECAT_DATA_PATH_OVERRIDE", "").strip()
-    data_path = (
-        Path(data_override).resolve()
-        if data_override
-        else PROJECT / "data" / "decat_features_1626.csv"
-    )
+    data_path = Path(data_override).resolve()
     if not data_path.is_file():
         raise FileNotFoundError(f"Active data file not found: {data_path}")
     profile_name = os.environ.get("DECAT_PARAMETER_PROFILE", "seed242_baseline").strip()

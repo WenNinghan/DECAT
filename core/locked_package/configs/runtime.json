@@ -3,8 +3,8 @@
   "name": "DECAT runtime defaults",
   "locked_at": "2026-05-18",
   "purpose": "Validation-selected checkpoint ensemble; test split remains held out.",
-  "data_csv_path": "data/decat_features_1626.csv",
-  "fixed_split_json": "data/split.json",
+  "data_csv_path": "outputs/training/prepared/model_inputs.csv",
+  "fixed_split_json": "outputs/training/prepared/split.json",
   "output_root": "outputs/training",
   "params": {
     "fp_bits": 3147,

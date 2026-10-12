@@ -5,19 +5,71 @@ from __future__ import annotations
 import json
 import os
 import pickle
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional
 
 import numpy as np
 import torch
+from rdkit import Chem, DataStructs
+from rdkit.Chem import AllChem
+from sklearn.preprocessing import RobustScaler
 
 from .applicability import evaluate_ad_for_fingerprint
-from .input_chemistry import read_csv_robust
 
 
 def _load_json_file(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _restore_scaler(state: dict) -> RobustScaler:
+    """Restore fitted statistics without refitting on training records."""
+    scaler = RobustScaler(**state["params"])
+    scaler.center_ = np.asarray(state["center_"], dtype=state["center_dtype"])
+    scaler.scale_ = np.asarray(state["scale_"], dtype=state["scale_dtype"])
+    scaler.n_features_in_ = int(state["n_features_in_"])
+    return scaler
+
+
+@dataclass
+class FittedPreprocessing:
+    """The fitted transformations and class vocabulary needed at inference."""
+
+    ph_scaler: RobustScaler
+    logk_scaler: RobustScaler
+    category_cols: list[str]
+    num_dim: int
+
+    @classmethod
+    def from_state(cls, state: dict) -> "FittedPreprocessing":
+        return cls(
+            ph_scaler=_restore_scaler(state["ph_scaler"]),
+            logk_scaler=_restore_scaler(state["logk_scaler"]),
+            category_cols=list(state["category_cols"]),
+            num_dim=int(state["numeric_dim"]),
+        )
+
+
+def _training_fingerprints(
+    records: list[dict], fingerprint: dict, selected_idx: np.ndarray
+) -> np.ndarray:
+    """Recreate the ordered AD reference space from its public structures."""
+    rows = []
+    for record in records:
+        mol = Chem.MolFromSmiles(record["smiles"])
+        if mol is None:
+            raise ValueError("An applicability reference contains invalid SMILES.")
+        fp = AllChem.GetMorganFingerprintAsBitVect(
+            mol,
+            int(fingerprint["radius"]),
+            int(fingerprint["n_bits"]),
+            useChirality=bool(fingerprint["use_chirality"]),
+        )
+        dense = np.zeros(int(fingerprint["n_bits"]), dtype=np.int8)
+        DataStructs.ConvertToNumpyArray(fp, dense)
+        rows.append(dense[selected_idx] > 0.5)
+    return np.asarray(rows, dtype=bool)
 
 
 def build_numeric_vector(
@@ -61,11 +113,6 @@ def configure_runtime(package: Path, config: dict) -> None:
     environment.update(
         {
             "DECAT_PROJECT_DIR": str(package),
-            "DECAT_RUNTIME_DATA_CSV": str(package / config["data"]["path"]),
-            "DECAT_RUNTIME_FIXED_SPLIT_JSON": str(package / config["split"]["path"]),
-            "DECAT_RUNTIME_FIXED_SPLIT_JSON_FALLBACK": str(
-                package / config["split"]["path"]
-            ),
             "DECAT_RUNTIME_MODE": "fixed_json",
             "DECAT_RUNTIME_FIXED_OBJECTIVE_TARGET": "val",
             "DECAT_RUNTIME_FIXED_SEED": "242",
@@ -127,6 +174,8 @@ def load_predictor(package_root: Path, artifacts_root: Path):
 
     try:
         config = _load_json_file(str(config_path))
+        preprocessing_path = package / config["preprocessing"]["path"]
+        preprocessing = _load_json_file(str(preprocessing_path))
         ensemble = _load_json_file(str(checkpoint_manifest_path))
         states = list(ensemble.get("states", []))
         weights = np.asarray(ensemble.get("weights", []), dtype=np.float64)
@@ -140,25 +189,22 @@ def load_predictor(package_root: Path, artifacts_root: Path):
             )
 
         configure_runtime(package, config)
-        # Model defaults and dataset options read the configured runtime settings.
+        # Model defaults read the configured runtime settings.
         from .config import FingerprintConfig
-        from .data.dataset import FingerprintReactionDataset
-        from .data.features import _get_fp_ranking
         from .models.decat import ContextualDualExpertRegressor
 
-        split = _load_json_file(str(package / config["split"]["path"]))
-        train_idx = np.asarray(split["train_idx"], dtype=int)
-        fp_bits = int(config["params"]["fp_bits"])
-        dataset = FingerprintReactionDataset(
-            str(package / config["data"]["path"]), fp_bits
-        )
-        dataset.fit_scalers(train_idx)
-        selected_idx = np.asarray(
-            _get_fp_ranking(dataset, train_idx, fp_bits, "rf")[
-                : int(config["params"]["topk_features"])
-            ],
-            dtype=int,
-        )
+        dataset = FittedPreprocessing.from_state(preprocessing)
+        fingerprint = preprocessing["fingerprint"]
+        fp_bits = int(fingerprint["n_bits"])
+        selected_idx = np.asarray(preprocessing["selected_idx"], dtype=int)
+        if (
+            fp_bits != int(config["params"]["fp_bits"])
+            or len(selected_idx) != int(config["params"]["topk_features"])
+            or dataset.num_dim != 1 + len(dataset.category_cols)
+        ):
+            raise ValueError(
+                "Fitted preprocessing does not match the model configuration."
+            )
         model_config = FingerprintConfig()
         for key, value in config["params"].items():
             if hasattr(model_config, key):
@@ -193,19 +239,10 @@ def load_predictor(package_root: Path, artifacts_root: Path):
                 "The inference bundle contains no serialized residual-RF model."
             )
 
-        train_fp_selected = np.asarray(
-            dataset.fingerprint[train_idx][:, selected_idx] > 0.5, dtype=bool
+        ad_reference = preprocessing["ad_reference"]
+        train_fp_selected = _training_fingerprints(
+            ad_reference, fingerprint, selected_idx
         )
-        df_ref = read_csv_robust(str(package / config["data"]["path"]))
-        compound_col = next(
-            (
-                column
-                for column in ["chemical compound", "chemical_compound", "compound"]
-                if column in df_ref.columns
-            ),
-            None,
-        )
-        smiles_col = "SMILES" if "SMILES" in df_ref.columns else "smiles"
         bundle = {
             "models": models,
             "ensemble_weights": weights,
@@ -216,18 +253,9 @@ def load_predictor(package_root: Path, artifacts_root: Path):
             "residual_models": residual_models,
             "residual_feature_dim": int(len(selected_idx) + dataset.num_dim),
             "device": inference_device,
-            "train_idx": train_idx,
             "train_fp_selected_bool": train_fp_selected,
-            "train_compounds": (
-                df_ref.iloc[train_idx][compound_col].astype(str).tolist()
-                if compound_col
-                else []
-            ),
-            "train_smiles": (
-                df_ref.iloc[train_idx][smiles_col].astype(str).tolist()
-                if smiles_col
-                else []
-            ),
+            "train_compounds": [record["compound"] for record in ad_reference],
+            "train_smiles": [record["smiles"] for record in ad_reference],
             "params": dict(config["params"]),
             "model_label": "SEEN25-1626 Top-3 validation ensemble + serialized residual RF",
         }

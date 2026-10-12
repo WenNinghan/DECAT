@@ -2,6 +2,7 @@
 # Match the validated model environment; the residual RF uses scikit-learn 1.7.2.
 streamlit==1.52.2
 pandas==2.3.3
+openpyxl==3.1.5
 numpy==2.2.6
 requests==2.32.5
 beautifulsoup4==4.13.5

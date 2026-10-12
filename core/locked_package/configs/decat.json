@@ -2,32 +2,34 @@
   "schema_version": 1,
   "name": "DECAT",
   "locked_at": "2026-07-23",
-  "purpose": "One-click reproduction of DECAT on 1626-row 25-class dataset with record-level fixed split and validation-selected nn_plus_res_rf head.",
+  "purpose": "Train DECAT from the original experimental workbook and user-supplied molecular inputs; run the pretrained website from fitted runtime configuration.",
   "evaluation_scope": "record-level holdout; atomic group = SMILES + exact pH + category; same molecule at different pH may span splits; no exact condition leakage; no test-guided selection",
   "selection_protocol": "validation-only",
   "final_component": "nn_plus_res_rf",
   "data": {
-    "path": "data/decat_features_1626.csv",
-    "sha256": "80ad358a182328a3b42cf31ae4dc684347bc46a0b6d4ac52f4cd3b532cc7e549",
+    "path": "../../data/DECAT_Dataset_with_References.xlsx",
+    "sha256": "941f53b2c269cbf9bc17ff3cb567fb533848c851b37871d3a60bc124fe775d3b",
     "row_count": 1626,
     "class_count": 25,
-    "category_column": "category27_label"
+    "category_column": "category27_label",
+    "structure_input_columns": [
+      "NO.",
+      "SMILES",
+      "category27_label"
+    ]
   },
   "split": {
-    "path": "data/split.json",
-    "sha256": "b681889a4f58017a5f8ba92f06497c9e7ee14d84e2188e245b4072f118247787",
-    "seed": 116,
-    "train_n": 1240,
-    "validation_n": 186,
-    "test_n": 200
+    "algorithm": "seen_molecule_conditions",
+    "search_seeds": 512
   },
   "runtime": {
     "python": "python",
     "base_config_path": "configs/runtime.json",
     "parameter_profile": "25class_stack",
     "source_files": {
-      "configs/runtime.json": "5d9851fd455afb835fc778ba11031d7c296ba324bfdc94720707621bbc3c142f",
-      "scripts/train.ps1": "30dba5a0df5e848fcabe4831ac7f5fccc821bde0d3e2b4a7ff287187b799d727",
+      "configs/runtime.json": "db398b2c08b268b8fbe5403106b6fff10805dbb1bc821e9da6b49c626861eb31",
+      "configs/preprocessing.json": "f489a7de81133a5ee5249b8f2adb89bac40b1e35dbb6cbdbfabf8c51a784f4c7",
+      "train.py": "a7d80322065ff27159809e35fa8ac6b694aa83e7547eb0d10519efa17fbf75fe",
       "src/decat/__init__.py": "f3cbe959122ceafb6fd241f0496c2cf8fd27c4a5de7503e5e76f76140e00bbc7",
       "src/decat/applicability.py": "c852a7610f206f87fe6d4583c82b6805fbc1248e6c66ed40361bfe684ec5a0a5",
       "src/decat/chemistry.py": "58e938404b0648cce969757e0bac26c4d98b3ee2c3b0526ad9e8e7b4a468fdf7",
@@ -35,13 +37,14 @@
       "src/decat/data/__init__.py": "e2c1d705742cd34e837baa8ee0d06fd66041a19772785708ac7491172fdf70a6",
       "src/decat/data/dataset.py": "d59c1955ab83ae69ef2d80f2b54a61139bf0027750b579189336fd2c969feb46",
       "src/decat/data/features.py": "b5f2980f55cd0ee50be6919f1d97db278d18fbc75494c8ded920af37ab75482c",
-      "src/decat/data/splitting.py": "d84989e683cf60b956ed339fa289804715227c2ace4ebe545067d01ff3ebcaf6",
+      "src/decat/data/inputs.py": "bfbf225cba9c894ae4aa3b5f7eaccd1f45910e5b332d362412b259bd5ebc4c88",
+      "src/decat/data/splitting.py": "8e08e8f06c507306715d3e9752066f5c0b7bdd725ba3ef83de5fb7cc2e0a7e96",
       "src/decat/evaluation.py": "9a0e96945623f845f308f2c93642b131e2666cc29488864df9239a8a816f5aac",
       "src/decat/experiments/__init__.py": "4dc916e2f17b1ad26a2a03849f2bf9dc80e9672549b9ac00dbeec30b93d0944b",
       "src/decat/experiments/ablation.py": "dc3626d724e525f5179f8d5003ed23aa950b966792b8012142e1caa34fb819bf",
       "src/decat/experiments/retrain.py": "895a84de647d37148cf28323ec909be94137638a61c7f2b2e26131b17bc78790",
       "src/decat/experiments/search.py": "f5e5c99c40e31ebb695ebdca19ff7278b9fac3618cc7b9042fab4e1a29eb63cf",
-      "src/decat/inference.py": "271bcfc622db2358dc757fc156f4908f9eb65cc3a6da751893b4c43f2d51f7eb",
+      "src/decat/inference.py": "9bde36ab152e710a256116466618235dc80aca0149fbb9ce8860031387de5529",
       "src/decat/input_chemistry.py": "c34f6311447cc2812ba739ba7a4c280a1f51f23babd1e115fa9e33d93167c108",
       "src/decat/interpretation/__init__.py": "a83e568c5a6ffbf8b5b774f5bc46d1cd53dedb3c1d8902a336f5b68f4acbd1f3",
       "src/decat/interpretation/attribution.py": "a887ff319fa718af9a540a836dd2b70bc6d40fd9f0c2d2285d361b977345a360",
@@ -61,11 +64,10 @@
       "src/decat/training/engine.py": "7e2425266f2cc7f67867979f87fb1d30d67ca9e12b0f78c010c87cd62bc7c83a",
       "src/decat/training/ensemble.py": "e73e0e2be6ee2fe57f33bb480b534d2b453c4c37476ba23351ebe5e94a1b8300",
       "src/decat/training/losses.py": "3126e7e3f623a8ea496f8f706eee5173eab63b04f504ea8ec07cecec36ff50b9",
-      "src/decat/training/protocol.py": "51a7dee8e3ef7c5444d86b85544352b1c287edb261cd248bb5dc9cfe29269fd1",
+      "src/decat/training/protocol.py": "641ccecd1c299a39db2951f37cb25a0691c86e1c9fb0dba4595d8b449483daa3",
       "src/decat/training/sampling.py": "242c9d9451bc96fd4359aba1e2855196eef66a574a0ae57a90d63cab972e5f30",
       "src/decat/training/steps.py": "9b673bfb4b59b353979db1514d3f9acda55332dcf83fa24bbe3f837cb33b0aee",
-      "src/decat/training/workflow.py": "f62ff8f7c03946287e19c94430b8459ef7897c988a6fe15fd4290438f528cbac",
-      "train.py": "2f054ddd30cecfdc14e6531964ca79dc5617d9d8ce81ef925729a9136eea0b0f"
+      "src/decat/training/workflow.py": "f62ff8f7c03946287e19c94430b8459ef7897c988a6fe15fd4290438f528cbac"
     }
   },
   "params": {
@@ -105,5 +107,8 @@
     "DECAT_CATEGORY_A_FAMILY_OVERRIDE": "other",
     "DECAT_CALIBRATE_COMPONENTS": "0",
     "DECAT_CALIBRATE_BLEND": "0"
+  },
+  "preprocessing": {
+    "path": "configs/preprocessing.json"
   }
 }
