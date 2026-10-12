@@ -4,7 +4,7 @@ DECAT includes training and prediction source, pretrained weights, the original 
 
 ## Authors
 
-Guosen Zhang<sup>a,b,1</sup>, Ninghan Wen<sup>a,1</sup>, Chaosen Yang<sup>b</sup>, Jinqi Jiang<sup>a,b</sup>, Haorao Chen<sup>b</sup>, Yiwen Tang<sup>a</sup>, Lei Wang<sup>a</sup>, Pengchao Xie<sup>b,*</sup>, Xueming Liu<sup>a,*</sup>
+Guosen Zhang<sup>a,b,1</sup>, Ninghan Wen<sup>a,1</sup>, Chaosen Yang<sup>b</sup>, Jinqi Jiang<sup>a,b</sup>, Haoran Chen<sup>b</sup>, Yiwen Tang<sup>a</sup>, Lei Wang<sup>a</sup>, Pengchao Xie<sup>b,*</sup>, Xueming Liu<sup>a,*</sup>
 
 <sup>a</sup> School of Artificial Intelligence and Automation, Institute of Medical Equipment Science and Engineering, Huazhong University of Science and Technology, Wuhan 430074, China
 
