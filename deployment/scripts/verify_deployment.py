@@ -1,4 +1,5 @@
 """Verify the self-contained deployment bundle without training."""
+
 from __future__ import annotations
 
 import importlib.util
@@ -18,17 +19,19 @@ def main() -> int:
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
 
-    bundle, _, error = module.load_decat_v9_bundle("", "", str(module.RUNTIME_DATASET_PATH), "")
+    bundle, _, error = module.load_predictor()
     if bundle is None:
         raise RuntimeError(error)
     if len(bundle["models"]) != 3 or len(bundle["residual_models"]) != 1:
-        raise RuntimeError("Deployment bundle does not contain Top-3 + one residual-RF model")
+        raise RuntimeError(
+            "Deployment bundle does not contain Top-3 + one residual-RF model"
+        )
     if int(bundle["fp_bits"]) != 3147 or len(bundle["selected_idx"]) != 914:
         raise RuntimeError("Unexpected locked fingerprint dimensions")
 
     fp = module.smiles_to_fingerprint("CCO", fp_size=int(bundle["fp_bits"]))
     category = module.classify_category27_from_smiles("CCO")
-    prediction, detail = module.predict_with_decat_v9(bundle, fp, 7.0, category, "CCO")
+    prediction, detail = module.predict(bundle, fp, 7.0, category, "CCO")
     if not math.isfinite(float(prediction)):
         raise RuntimeError("Prediction is not finite")
 
@@ -41,4 +44,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

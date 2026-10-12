@@ -7,7 +7,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $packageRoot = Split-Path -Parent $PSScriptRoot
-$launcher = Join-Path $PSScriptRoot "_repro_launch.py"
+$launcher = Join-Path $packageRoot "train.py"
 $pythonCommand = Get-Command $Python -ErrorAction SilentlyContinue
 if ($pythonCommand) {
     $pythonExecutable = $pythonCommand.Source

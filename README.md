@@ -18,13 +18,25 @@ On Linux, install the system packages listed in `packages.txt`. For Streamlit Co
 Use the same Python environment and run from the repository root:
 
 ```shell
-python core/locked_package/scripts/_repro_launch.py
+python core/locked_package/train.py --verify-only
+python core/locked_package/train.py
 ```
 
-The training code and configuration are in `core/locked_package/`. The app uses the shared model source and the pretrained weights in `deployment/artifacts/`.
+Use `--output-root <directory>` to choose where local training outputs are saved. On Windows, `core/locked_package/scripts/train.ps1` provides the same training and `-VerifyOnly` options.
+
+The fixed training configuration is in `core/locked_package/configs/decat.json`, with runtime defaults in `configs/runtime.json`. The source package is `core/locked_package/src/decat/`:
+
+- `config.py` and `runtime.py`: settings, reproducibility, and run state.
+- `chemistry.py` and `data/`: chemical categories, features, datasets, and split loading.
+- `models/`: attention layers, expert networks, and the shared DECAT model.
+- `training/`: losses, epoch execution, ensembling, selection protocol, and workflow.
+- `inference.py`, `applicability.py`, and `evaluation.py`: prediction, applicability checks, and metrics.
+- `interpretation/`, `plotting/`, and `experiments/`: explanations, figures, and optional experiments.
+
+The app uses this shared package and the pretrained weights in `deployment/artifacts/`.
 
 ## Data and licenses
 
-The [study dataset](data/DECAT_Dataset_with_References.xlsx) contains 1,626 records with `NO.`, `Compounds`, `log k`, `pH`, and `Reference` fields. Source references remain in the workbook. The processed [feature data](core/locked_package/data/decat_features_1626.csv) and [fixed split](core/locked_package/data/split_seed242_1626.json) are the training and inference inputs.
+The [study dataset](data/DECAT_Dataset_with_References.xlsx) contains 1,626 records with `NO.`, `Compounds`, `log k`, `pH`, and `Reference` fields. Source references remain in the workbook. The processed [feature data](core/locked_package/data/decat_features_1626.csv) and [fixed split](core/locked_package/data/split.json) are the training and inference inputs.
 
 Code is covered by the [MIT License](LICENSE-CODE-MIT.txt). Data and model weights are covered by the existing [research-use terms](LICENSE-DATA-MODEL-RESEARCH-USE.txt); third-party source materials retain their own terms.

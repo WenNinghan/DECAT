@@ -1,0 +1,1 @@
+"""Plotting components for DECAT."""
