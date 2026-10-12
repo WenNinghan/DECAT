@@ -4,10 +4,6 @@ pandas
 scikit-learn
 scikit-optimize
 scipy
-rdkit-pypi
+rdkit==2025.9.1
 matplotlib
 seaborn
-xgboost
-bayesian-optimization
-shap
-

@@ -14,7 +14,7 @@ from torch import nn
 
 PROJECT = Path(__file__).resolve().parent
 BASE_CONFIG_PATH = PROJECT / "configs" / "V14_1637_validation_topk5.json"
-SPLIT_PATH = PROJECT / "data" / "固定划分_1626_同分子异pH非均分_75-12.5-12.5.json"
+SPLIT_PATH = PROJECT / "data" / "split_seed242_1626.json"
 
 PARAMS = {
     "fp_bits": 3147,
@@ -568,7 +568,7 @@ def main() -> None:
     data_path = (
         Path(data_override).resolve()
         if data_override
-        else PROJECT / "data" / "反应logk指纹数据_25类_含环境无机物_Other_1626条.csv"
+        else PROJECT / "data" / "decat_features_1626.csv"
     )
     if not data_path.is_file():
         raise FileNotFoundError(f"Active data file not found: {data_path}")
@@ -603,7 +603,7 @@ def main() -> None:
     output_root = (
         Path(output_root_override) / f"seed_{seed}"
         if output_root_override
-        else PROJECT / "输出" / "decat_v23_blind_seed_ensemble" / f"seed_{seed}"
+        else PROJECT / "outputs" / "decat_v23_blind_seed_ensemble" / f"seed_{seed}"
     )
     base_config = json.loads(BASE_CONFIG_PATH.read_text(encoding="utf-8-sig"))
     environment = {str(key): str(value) for key, value in base_config["env"].items()}

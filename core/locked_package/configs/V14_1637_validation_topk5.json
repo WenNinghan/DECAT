@@ -3,15 +3,10 @@
   "name": "DECAT_V14_validation_selected_topk5",
   "locked_at": "2026-05-18",
   "purpose": "Validation-selected checkpoint ensemble; test split remains held out.",
-  "data_csv_path": "data/反应logk指纹数据_25类_含环境无机物_Other_1626条.csv",
-  "fixed_split_json": "data/固定划分_1626_同分子异pH非均分_75-12.5-12.5.json",
+  "data_csv_path": "data/decat_features_1626.csv",
+  "fixed_split_json": "data/split_seed242_1626.json",
   "output_root": "outputs/retest_1626_25class_context",
   "source_variant": "centered_topk1100_positive_micro_physics",
-  "positive_physics_contribution": {
-    "no_physics_test_r2": 0.8238247603928412,
-    "safe_physics_test_r2": 0.8256400027207947,
-    "delta_r2": 0.0018152423279535
-  },
   "params": {
     "fp_bits": 3147,
     "topk_features": 1100,

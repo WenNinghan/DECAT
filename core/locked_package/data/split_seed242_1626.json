@@ -1,6 +1,6 @@
 {
-  "source_csv": "data/反应logk指纹数据_25类_含环境无机物_Other_1626条.csv",
-  "source_sha256": "72dfb269c9ffdf95df0d0ea079c8a87e2d74223e544c1bbb5e12f1c966ef5c9d",
+  "source_csv": "data/decat_features_1626.csv",
+  "source_sha256": "80ad358a182328a3b42cf31ae4dc684347bc46a0b6d4ac52f4cd3b532cc7e549",
   "n_samples": 1626,
   "split_protocol": "Pre-registered non-uniform seen-molecule condition interpolation split. Atomic groups are RDKit canonical isomeric SMILES + exact pH + category27_label and never cross sets. Validation/test molecules are preferentially represented by another condition in training; minimal singleton exceptions are allowed only to cover categories with at least 10 rows. Molecules are not evenly divided across the three sets.",
   "group_identifier": "RDKit canonical isomeric SMILES + exact IEEE-754 pH + category27_label",

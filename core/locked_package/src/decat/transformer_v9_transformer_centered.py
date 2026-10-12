@@ -1,16 +1,6 @@
-﻿# -*- coding: utf-8 -*-
-"""
-transformer_v9_transformer_centered.py
+# -*- coding: utf-8 -*-
+"""DECAT training, preprocessing and inference model with optional local exports."""
 
-基于 V8 PINN 扩展的单文件 V9 版本：
-- V9 将双专家解释从“对称专家融合”改为“Transformer 主预测 + MLP 有界残差校正”
-- 默认保留弱 pH 有限差分物理先验，并建议关闭 V8 曲率 PINN 残差
-- 引入化学感知注意力偏差（chemistry-aware attention bias）用于Transformer自注意力机制
-- 双专家模型（注意力专家 + MLP专家），带有不确定性感知门控（uncertainty-aware gating）
-- 因果不变训练目标（causal-invariant training objective）：预测 + 不变性 + 组分布鲁棒优化（Group-DRO） + 物理先验
-- 自适应多模型融合（神经网络 + 直方图梯度提升 + 随机森林 + 残差/堆叠学习器），使用单纯形权重搜索
-- 支持消融实验 + 配对统计显著性分析
-"""
 
 import copy
 import csv
@@ -28,28 +18,22 @@ import matplotlib as mpl
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
-# 设置matplotlib字体以支持生成可编辑PDF
+
 mpl.rcParams["pdf.fonttype"] = 42
 mpl.rcParams["ps.fonttype"] = 42
 mpl.rcParams["svg.fonttype"] = "none"
 
 
 def _savefig_with_pdf(fig_or_plt, output_path, **kwargs):
-    """
-    保存图片为PNG/JPG格式，同时保存为Illustrator可编辑文本的PDF格式。
-    
-    参数:
-        fig_or_plt: matplotlib的figure对象或plt模块
-        output_path: 输出文件路径
-        **kwargs: 传递给savefig的其他参数
-    """
+
+
     output_path = str(output_path)
     fig_or_plt.savefig(output_path, **kwargs)
     base, ext = os.path.splitext(output_path)
-    # 如果输出扩展名不是pdf，则额外保存一份pdf版本
+
     if ext.lower() != ".pdf":
         pdf_kwargs = dict(kwargs)
-        # PDF保存通常不需要dpi参数（或者是矢量图），移除dpi以避免警告或错误
+
         pdf_kwargs.pop("dpi", None)
         fig_or_plt.savefig(base + ".pdf", **pdf_kwargs)
 
@@ -73,7 +57,7 @@ from skopt.space import Categorical, Integer, Real
 from skopt.utils import use_named_args
 from torch.utils.data import DataLoader, Dataset, Subset, WeightedRandomSampler
 
-# 尝试导入科学计算统计库，如果不可用则设为None
+
 try:
     from scipy.stats import gaussian_kde, pearsonr, ttest_rel, wilcoxon
 except Exception:
@@ -82,14 +66,14 @@ except Exception:
     ttest_rel = None
     wilcoxon = None
 
-# 忽略警告信息，保持输出整洁
+
 warnings.filterwarnings("ignore")
-# 禁用RDKit的日志输出
+
 RDLogger.DisableLog("rdApp.*")
 
 
 # =============================================================================
-# 全局状态 / 路径配置
+
 # =============================================================================
 SCRIPT_DIR = os.path.dirname(__file__)
 
@@ -170,7 +154,7 @@ def _normalized_global_descriptors(mol: Chem.Mol) -> np.ndarray:
 
 
 def _resolve_preferred_category_labels(df: pd.DataFrame) -> Optional[pd.Series]:
-    """优先解析 V6 的 27 类标签；不存在时返回 None 交给 V7 的 category 兜底。"""
+
     resolved = pd.Series(pd.NA, index=df.index, dtype="object")
     found = False
     for col in CATEGORY_LABEL_PRIORITY:
@@ -189,7 +173,7 @@ def _resolve_preferred_category_labels(df: pd.DataFrame) -> Optional[pd.Series]:
 
 
 def _resolve_default_data_csv_path() -> str:
-    """V6/V7 兼容的数据路径解析：显式环境变量优先，其次使用清洗重分类数据。"""
+
     override = str(
         os.environ.get(
             "TRANSFORMER_V7_DATA_CSV",
@@ -202,9 +186,7 @@ def _resolve_default_data_csv_path() -> str:
     if override and os.path.isfile(override):
         return override
     candidates = [
-        os.path.join(SCRIPT_DIR, "补充后4096位分子指纹数据默认pH=7(整体)_按物质家族重分类12类_去除独立金属与无机离子_20260320.csv"),
-        os.path.join(SCRIPT_DIR, "补充后4096位分子指纹数据默认pH=7(整体)_按物质家族重分类12类_20260317.csv"),
-        os.path.join(SCRIPT_DIR, "补充后4096位分子指纹数据默认pH=7(整体).csv"),
+        os.path.join(os.path.dirname(os.path.dirname(SCRIPT_DIR)), "data", "decat_features_1626.csv"),
     ]
     for path in candidates:
         if os.path.isfile(path):
@@ -225,21 +207,20 @@ def _resolve_output_root() -> str:
     return os.path.join(SCRIPT_DIR, "transformer_v9_transformer_centered")
 
 
-# 数据文件路径，默认优先指向 V6 清洗/重分类数据；也支持环境变量覆盖
 DATA_CSV_PATH = _resolve_default_data_csv_path()
 
 
 def _get_data_csv_path() -> str:
     path = _resolve_default_data_csv_path()
     return path if path else DATA_CSV_PATH
-# 输出目录
+
 OUT_DIR = _resolve_output_root()
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# 记录最佳结果的字典
+
 BEST_RESULT: Dict[str, object] = {
     "iter": 0,
-    "objective_target": "val",  # 优化目标：验证集(val)或测试集(test)
+    "objective_target": "val",
     "objective_r2": float("-inf"),
     "val_r2": float("-inf"),
     "val_rmse": float("nan"),
@@ -253,18 +234,18 @@ BEST_RESULT: Dict[str, object] = {
 }
 
 GLOBAL_ITER = 0
-SPLIT_CACHE: Dict[str, np.ndarray] = {}  # 数据集划分缓存
-FP_RANK_CACHE: Dict[Tuple[int, str], np.ndarray] = {}  # 特征排序缓存
-DATASET_BASE_CACHE: Dict[Tuple[str, int, int, int, int], Dict[str, object]] = {}  # 数据集基础缓存
+SPLIT_CACHE: Dict[str, np.ndarray] = {}
+FP_RANK_CACHE: Dict[Tuple[int, str], np.ndarray] = {}
+DATASET_BASE_CACHE: Dict[Tuple[str, int, int, int, int], Dict[str, object]] = {}
 DATASET_CACHE_MAX_ENTRIES = 12
-# 子结构与位映射缓存
+
 BIT_SUBSTRUCTURE_CACHE: Dict[Tuple[str, int, int, Tuple[int, ...], Tuple[int, ...]], Dict[int, Dict[str, object]]] = {}
-OBJECTIVE_TARGET = "val"  # 贝叶斯优化目标：默认使用验证集，之后在训练+验证集上重新训练最终模型
-RUN_OUTPUT_DIR: Optional[str] = None  # 当前运行的输出目录
-LAST_TRAINED_MODEL: Optional[nn.Module] = None  # 诊断用途：保留最近一次 objective 训练后的模型引用
+OBJECTIVE_TARGET = "val"
+RUN_OUTPUT_DIR: Optional[str] = None
+LAST_TRAINED_MODEL: Optional[nn.Module] = None
 
 def _clean_smiles_text(value: object) -> str:
-    """清洗 SMILES 字符串中的零宽空格、BOM 和首尾空白。"""
+
     if value is None:
         return ""
     text = str(value)
@@ -278,7 +259,7 @@ def _clean_smiles_text(value: object) -> str:
 
 
 def _match_feature_dim(x: torch.Tensor, target_dim: int) -> torch.Tensor:
-    """按需截断或补零，使特征维度匹配线性层输入。"""
+
     target_dim = int(max(0, target_dim))
     if x.dim() == 1:
         x = x.unsqueeze(0)
@@ -293,41 +274,39 @@ def _match_feature_dim(x: torch.Tensor, target_dim: int) -> torch.Tensor:
     return torch.cat([x, pad], dim=1)
 
 # =============================================================================
-# 独立的自包含基础组件 (无需外部transformer导入)
+
 # =============================================================================
 class FingerprintConfig:
-    """
-    模型配置类，定义超参数默认值。
-    """
-    d_model = 256  # 模型维度
-    dropout = 0.3  # Dropout比率
-    activation = "gelu"  # 激活函数
-    n_heads = 4  # 注意力头数
-    n_layers = 2  # Transformer层数
-    max_fp_tokens = 128  # 最大指纹token数（Top-K特征）
 
-    batch_size = 32  # 批次大小
-    learning_rate = 1e-4  # 学习率
-    weight_decay = 1e-2  # 权重衰减
-    max_epochs = 100  # 最大训练轮数
-    early_stopping_patience = 80  # 早停耐心值
-    save_interval = 10  # 保存间隔
-    min_delta = 1e-4  # 最小改进阈值
-    scheduler_type = "plateau"  # 学习率调度器类型
-    fingerprint_scale = False  # 是否对指纹进行缩放
+
+    d_model = 256
+    dropout = 0.3
+    activation = "gelu"
+    n_heads = 4
+    n_layers = 2
+    max_fp_tokens = 128
+
+    batch_size = 32
+    learning_rate = 1e-4
+    weight_decay = 1e-2
+    max_epochs = 100
+    early_stopping_patience = 80
+    save_interval = 10
+    min_delta = 1e-4
+    scheduler_type = "plateau"
+    fingerprint_scale = False
     norm_first = False  # Pre-LN vs Post-LN
-    attn_pooling = "attn"  # 池化方式：attn (注意力池化), mean (平均池化), cls (CLS标记)
-    fp_bit_dropout = 0.0  # 指纹位Dropout比率
-    base_numeric_dim = 0  # pH + category 分支维度
+    attn_pooling = "attn"
+    fp_bit_dropout = 0.0
+    base_numeric_dim = 0
 
 
 class FingerprintReactionDataset(Dataset):
-    """
-    指纹反应数据集类，处理CSV数据加载、分子指纹生成及预处理。
-    """
+
+
     @staticmethod
     def _build_cache_key(csv_path: str, max_fp_bits: int) -> Tuple[str, int, int, int, int]:
-        """构建数据集缓存键值，基于文件路径、修改时间和大小。"""
+
         abs_path = os.path.abspath(csv_path)
         try:
             stat = os.stat(abs_path)
@@ -343,7 +322,7 @@ class FingerprintReactionDataset(Dataset):
 
     @staticmethod
     def _cache_store(cache_key: Tuple[str, int, int, int, int], payload: Dict[str, object]) -> None:
-        """存储数据集到内存缓存，带有LRU淘汰机制。"""
+
         global DATASET_BASE_CACHE
         if cache_key in DATASET_BASE_CACHE:
             DATASET_BASE_CACHE[cache_key] = payload
@@ -354,25 +333,19 @@ class FingerprintReactionDataset(Dataset):
         DATASET_BASE_CACHE[cache_key] = payload
 
     def __init__(self, csv_path: str, max_fp_bits: int, fingerprint_scale: bool = False):
-        """
-        初始化数据集。
-        
-        参数:
-            csv_path: CSV数据文件路径
-            max_fp_bits: 最大指纹位数
-            fingerprint_scale: 是否对指纹特征进行缩放（通常指纹是0/1，不需要缩放）
-        """
+
+
         super().__init__()
         if not os.path.exists(csv_path):
             raise FileNotFoundError(f"Data file not found: {csv_path}")
         cache_key = self._build_cache_key(csv_path, int(max_fp_bits))
         cache_item = DATASET_BASE_CACHE.get(cache_key)
 
-        # 如果没有缓存，则加载数据并计算指纹
+
         if cache_item is None:
             df = pd.read_csv(csv_path)
-            # 查找SMILES列
-            # 查找SMILES列
+
+
             smiles_col = "SMILES" if "SMILES" in df.columns else ("smiles" if "smiles" in df.columns else None)
             if smiles_col is None:
                 raise ValueError("SMILES column not found.")
@@ -380,12 +353,12 @@ class FingerprintReactionDataset(Dataset):
             if "pH" not in df.columns:
                 raise ValueError("pH column not found.")
 
-            # 查找目标变量列（logk）
+
             target_col = next((c for c in ["logk", "LogK", "LOGK", "logK"] if c in df.columns), None)
             if target_col is None:
                 raise ValueError("logk column not found.")
 
-            # V6 优先使用 category27_* 主分类；若数据还没标注，则保留 V7 的 category 兜底。
+
             preferred_cat = _resolve_preferred_category_labels(df)
             if preferred_cat is not None:
                 df["__v7_category_label__"] = preferred_cat.astype(str)
@@ -396,7 +369,7 @@ class FingerprintReactionDataset(Dataset):
                 df["__v7_category_label__"] = "Unknown"
                 category_col = "__v7_category_label__"
 
-            # 过滤无效数据：SMILES, pH, logk 都必须非空
+
             valid_mask = df[[smiles_col, "pH", target_col]].notna().all(axis=1)
             keep_cols = [smiles_col, "pH", target_col, category_col]
             df_core = df.loc[valid_mask, keep_cols].copy().reset_index(drop=True)
@@ -418,7 +391,7 @@ class FingerprintReactionDataset(Dataset):
                     .reset_index(drop=True)
                 )
 
-            # 处理类别列并进行 One-Hot 编码
+
             cat_series = df_core[category_col].fillna("Unknown").astype(str)
             x_cat = pd.get_dummies(cat_series, prefix="cat", dtype=np.uint8)
             cat_cols = x_cat.columns.tolist()
@@ -454,12 +427,12 @@ class FingerprintReactionDataset(Dataset):
             fps_list = []
             descriptor_list = []
             keep_idx = []
-            # 遍历SMILES生成分子指纹
+
             for i, smi in enumerate(df_core[smiles_col].astype(str).values):
                 mol = Chem.MolFromSmiles(smi)
                 if mol is None:
                     continue
-                # 生成Morgan指纹，半径2，位数为max_fp_bits
+
                 fp = AllChem.GetMorganFingerprintAsBitVect(mol, morgan_radius, int(max_fp_bits))
                 arr = np.zeros((int(max_fp_bits),), dtype=np.int8)
                 Chem.DataStructs.ConvertToNumpyArray(fp, arr)
@@ -470,7 +443,7 @@ class FingerprintReactionDataset(Dataset):
             if not fps_list:
                 raise ValueError("No valid fingerprints could be generated from SMILES.")
 
-            # 根据生成的指纹过滤原始数据
+
             df_core = df_core.iloc[keep_idx].reset_index(drop=True)
             x_cat = x_cat.iloc[keep_idx].reset_index(drop=True)
             if use_global_descriptors:
@@ -492,7 +465,7 @@ class FingerprintReactionDataset(Dataset):
             self.category_cols = cat_cols
             self.primary_category_dim = int(primary_category_dim)
 
-            # 存入缓存
+
             self._cache_store(
                 cache_key,
                 {
@@ -508,7 +481,7 @@ class FingerprintReactionDataset(Dataset):
                 },
             )
         else:
-            # 从缓存恢复
+
             self.csv_path = str(cache_item.get("csv_path", csv_path))
             self.max_fp_bits = int(cache_item.get("max_fp_bits", max_fp_bits))
             self.smiles = np.asarray(cache_item.get("smiles", []), dtype=object).copy()
@@ -530,19 +503,15 @@ class FingerprintReactionDataset(Dataset):
         self.logk_scaler = RobustScaler()
         self.fp_scaler = StandardScaler() if fingerprint_scale else None
 
-        # 默认使用所有样本初始化缩放器；训练流程通常会调用 fit_scalers(train_idx) 以避免数据泄露
+
         self.fit_scalers(np.arange(self.ph.shape[0], dtype=int))
 
     def __len__(self):
         return int(self.logk_raw.shape[0])
 
     def fit_scalers(self, train_indices: np.ndarray):
-        """
-        仅使用训练集数据拟合缩放器（Scaler），避免数据泄露。
-        
-        参数:
-            train_indices: 训练样本的索引数组
-        """
+
+
         idx = np.asarray(train_indices, dtype=int).reshape(-1)
         if idx.size == 0:
             idx = np.arange(self.ph.shape[0], dtype=int)
@@ -660,12 +629,8 @@ class FingerprintReactionDataset(Dataset):
         self.category[:, prior_cols] = prior_values
 
     def __getitem__(self, idx):
-        """
-        获取单个样本。
-        
-        返回:
-            包含指纹、数值特征、目标值等的字典。
-        """
+
+
         fp = self.fingerprint_scaled[idx].astype(np.float32)
         ph = self.ph_scaled[idx].astype(np.float32)
         cat_vec = self.category[idx].astype(np.float32)
@@ -684,11 +649,8 @@ class FingerprintReactionDataset(Dataset):
 
 
 class SelectedFeatureSubset(Dataset):
-    """
-    特征选择后的数据集包装器。
-    
-    仅返回选定的top-k指纹特征，用于减少输入维度。
-    """
+
+
     def __init__(self, base_ds: FingerprintReactionDataset, indices: np.ndarray, selected_col_idx: np.ndarray):
         super().__init__()
         self.base = base_ds
@@ -703,7 +665,7 @@ class SelectedFeatureSubset(Dataset):
     def __getitem__(self, i):
         base_idx = int(self.indices[i])
         fp_full = self.base.fingerprint_scaled[base_idx].astype(np.float32)
-        # 仅选择特定列
+
         fp_sel = fp_full[self.selected_col_idx]
         ph = self.base.ph_scaled[base_idx].astype(np.float32)
         cat_vec = self.base.category[base_idx].astype(np.float32)
@@ -722,16 +684,13 @@ class SelectedFeatureSubset(Dataset):
 
 
 class GatedFusion(nn.Module):
-    """
-    门控融合模块：动态融合分子特征和数值特征。
-    
-    使用 Sigmoid 门控机制学习两个特征模态的权重。
-    """
+
+
     def __init__(self, d_model: int, dropout: float = 0.1):
         super().__init__()
         self.linear_mol = nn.Linear(d_model, d_model)
         self.linear_num = nn.Linear(d_model, d_model)
-        # 门控网络：输入拼接后的特征，输出融合权重 z (0~1)
+
         self.gate = nn.Sequential(nn.Linear(d_model * 2, d_model), nn.Sigmoid())
         self.norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
@@ -739,18 +698,16 @@ class GatedFusion(nn.Module):
     def forward(self, mol_feat: torch.Tensor, num_feat: torch.Tensor) -> torch.Tensor:
         h_mol = self.linear_mol(mol_feat)
         h_num = self.linear_num(num_feat)
-        # 计算门控值 z
+
         z = self.gate(torch.cat([mol_feat, num_feat], dim=1))
-        # 加权融合：z * 分子 + (1-z) * 数值
+
         fused = z * h_mol + (1.0 - z) * h_num
         return self.norm(self.dropout(fused))
 
 
 class FingerprintTransformer(nn.Module):
-    """
-    基于MLP的基线模型（尽管名为Transformer，在此上下文中作为MLP基线存在）。
-    注意：真正的Transformer模型在后续的 FingerprintTransformerV5 类中实现。
-    """
+
+
     def __init__(self, fingerprint_dim: int, numeric_dim: int, config: Optional[FingerprintConfig] = None):
         super().__init__()
         self.config = config or FingerprintConfig
@@ -760,13 +717,13 @@ class FingerprintTransformer(nn.Module):
         self.num_input_dim = max(1, self.numeric_dim)
         act = nn.GELU() if self.config.activation == "gelu" else nn.ReLU()
 
-        # 分子指纹特征投影
+
         self.fp_proj = nn.Sequential(nn.Linear(self.fingerprint_dim, self.d_model), act, nn.Dropout(self.config.dropout))
-        # numeric 分支（pH + category）
+
         self.num_proj = nn.Sequential(nn.Linear(self.num_input_dim, self.d_model), act, nn.Dropout(self.config.dropout))
-        # 特征融合
+
         self.fusion = GatedFusion(self.d_model, dropout=float(self.config.dropout))
-        # 回归预测头
+
         self.regressor = nn.Sequential(
             nn.Linear(self.d_model, max(8, self.d_model // 2)),
             nn.GELU() if self.config.activation == "gelu" else nn.ReLU(),
@@ -784,40 +741,36 @@ class FingerprintTransformer(nn.Module):
 
 
 class _TransformerEncoderLayer(nn.Module):
-    """
-    标准的Transformer编码器层封装。
-    包含自注意力机制和前馈网络。
-    """
+
+
     def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
         super().__init__()
-        # 多头自注意力
+
         self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
-        # 前馈网络 (Feed Forward)
+
         self.linear1 = nn.Linear(d_model, d_model * 4)
         self.linear2 = nn.Linear(d_model * 4, d_model)
         self.dropout = nn.Dropout(dropout)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.act = nn.GELU()
-        self.last_attn = None  # 用于存储注意力权重以供可视化
+        self.last_attn = None
 
     def forward(self, x: torch.Tensor):
-        # 自注意力计算
+
         attn_out, attn_w = self.self_attn(x, x, x, need_weights=True, average_attn_weights=False)
         self.last_attn = attn_w
-        # 残差连接 + 层归一化
+
         x = self.norm1(x + self.dropout(attn_out))
-        # 前馈网络 + 残差连接 + 层归一化
+
         ff = self.linear2(self.dropout(self.act(self.linear1(x))))
         x = self.norm2(x + self.dropout(ff))
         return x
 
 
 class AttentionFingerprintTransformer(nn.Module):
-    """
-    基于注意力的指纹Transformer模型 (旧版实现，作为参考)。
-    V5版本主要使用 FingerprintTransformerV5 类。
-    """
+
+
     def __init__(self, fingerprint_dim: int, numeric_dim: int, config: Optional[FingerprintConfig] = None):
         super().__init__()
         self.config = config or FingerprintConfig
@@ -825,28 +778,28 @@ class AttentionFingerprintTransformer(nn.Module):
         self.numeric_dim = int(numeric_dim)
         self.d_model = int(self.config.d_model)
         self.num_token_dim = max(1, self.numeric_dim)
-        # 限制最大token数量
+
         self.max_fp_tokens = int(min(self.config.max_fp_tokens, self.fingerprint_dim))
         self.uses_sparse_tokens = self.max_fp_tokens < self.fingerprint_dim
 
-        # 指纹值嵌入
+
         self.fp_embed = nn.Linear(1, self.d_model)
-        # 指纹索引（位置）嵌入
+
         self.fp_index_embed = nn.Embedding(self.fingerprint_dim, self.d_model)
         self.fp_pos = nn.Parameter(torch.zeros(1, self.max_fp_tokens, self.d_model))
-        
+
         self.num_embed = nn.Linear(1, self.d_model)
-        # 编码器层堆叠
+
         self.encoder_layers = nn.ModuleList(
             [_TransformerEncoderLayer(self.d_model, int(self.config.n_heads), dropout=float(self.config.dropout)) for _ in range(int(self.config.n_layers))]
         )
-        # 交叉注意力层（指纹与数值特征交互）
+
         self.cross_attn = nn.MultiheadAttention(
             self.d_model, int(self.config.n_heads), dropout=float(self.config.dropout), batch_first=True
         )
         self.cross_norm = nn.LayerNorm(self.d_model)
-        
-        # 回归预测头
+
+
         self.regressor = nn.Sequential(
             nn.Linear(self.d_model, max(8, self.d_model // 2)),
             nn.GELU() if self.config.activation == "gelu" else nn.ReLU(),
@@ -861,67 +814,66 @@ class AttentionFingerprintTransformer(nn.Module):
         if numeric.dim() == 1:
             numeric = numeric.unsqueeze(-1)
         numeric = _match_feature_dim(numeric, self.num_token_dim)
-            
-        # 稀疏Token处理：仅选取Top-K最显著的指纹位作为Token
+
+
         if self.uses_sparse_tokens:
             vals, idx = torch.topk(fingerprint, k=self.max_fp_tokens, dim=1)
-            # Token Embedding = 索引嵌入 + 值嵌入 + 位置编码
+
             fp_tokens = self.fp_index_embed(idx) + self.fp_embed(vals.unsqueeze(-1)) + self.fp_pos
             self.last_token_indices = idx.detach()
         else:
-            # 密集Token处理
+
             fp_tokens = self.fp_embed(fingerprint.unsqueeze(-1)) + self.fp_pos[:, : self.fingerprint_dim, :]
             dense_idx = torch.arange(self.fingerprint_dim, device=fingerprint.device).unsqueeze(0).expand(fingerprint.size(0), -1)
             self.last_token_indices = dense_idx.detach()
-            
+
         num_tokens = self.num_embed(numeric.unsqueeze(-1))
         self.attn_cache["self"] = []
-        
-        # 通过Transformer编码器层
+
+
         for layer in self.encoder_layers:
             fp_tokens = layer(fp_tokens)
             if self.capture_attn and layer.last_attn is not None:
                 self.attn_cache["self"].append(layer.last_attn.detach())
-                
-        # 交叉注意力：指纹特征关注数值特征
+
+
         cross_out, cross_w = self.cross_attn(fp_tokens, num_tokens, num_tokens, need_weights=True, average_attn_weights=False)
         if self.capture_attn:
             self.attn_cache["cross"] = cross_w.detach()
-            
+
         fp_tokens = self.cross_norm(fp_tokens + cross_out)
-        # 平均池化
+
         pooled = fp_tokens.mean(dim=1)
         return self.regressor(pooled).squeeze(-1)
 
 
 class FingerprintTrainer:
-    """
-    通用训练器类，封装了训练、评估循环。
-    """
+
+
     def __init__(self, model: nn.Module, config: FingerprintConfig, device: Optional[str] = None):
         self.model = model
         self.config = config
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
         self.criterion = nn.MSELoss()
-        # AdamW优化器
+
         self.optimizer = optim.AdamW(
             self.model.parameters(), lr=float(self.config.learning_rate), weight_decay=float(self.config.weight_decay)
         )
-        # 学习率调度器：Plateau
+
         if str(self.config.scheduler_type).lower() == "plateau":
             self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
                 self.optimizer, mode="min", factor=0.5, patience=10, min_lr=1e-6
             )
         else:
             self.scheduler = None
-        # 混合精度训练支持
+
         self.use_amp = bool(str(self.device).lower().startswith("cuda"))
         self.amp_dtype = torch.float16
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp) if self.use_amp else None
 
     def _get_base_dataset(self, dataloader: DataLoader):
-        """辅助函数：从DataLoader中提取原始数据集对象以获取Scaler信息。"""
+
         ds = dataloader.dataset
         if isinstance(ds, SelectedFeatureSubset):
             return ds.base
@@ -930,44 +882,40 @@ class FingerprintTrainer:
         return ds
 
     def evaluate(self, dataloader: DataLoader) -> Tuple[float, float, float]:
-        """
-        评估模型性能。
-        
-        返回:
-            (平均损失, R2分数, RMSE)
-        """
+
+
         self.model.eval()
         total_loss = 0.0
         n_samples = 0
         preds_all = []
         y_all = []
         base_ds = self._get_base_dataset(dataloader)
-        
+
         with torch.no_grad():
             for batch in dataloader:
                 fingerprint = batch["fingerprint"].to(self.device)
                 numeric = batch["numeric"].to(self.device)
                 y = batch["logk"].to(self.device)
                 y_raw = batch["logk_raw"].numpy()
-                
+
                 preds_scaled = self.model(fingerprint, numeric)
                 loss = self.criterion(preds_scaled, y)
-                
+
                 bs = int(fingerprint.size(0))
                 total_loss += float(loss.item()) * bs
                 n_samples += bs
-                
-                # 反归一化预测值，得到真实的logk
+
+
                 preds_scaled_np = preds_scaled.detach().cpu().numpy().reshape(-1, 1)
                 preds_raw = base_ds.logk_scaler.inverse_transform(preds_scaled_np).reshape(-1)
                 preds_all.append(preds_raw)
                 y_all.append(y_raw.reshape(-1))
-                
+
         avg_loss = total_loss / max(1, n_samples)
         if preds_all:
             y_true = np.concatenate(y_all)
             y_pred = np.concatenate(preds_all)
-            # 过滤NaN值
+
             mask = np.isfinite(y_true) & np.isfinite(y_pred)
             y_true = y_true[mask]
             y_pred = y_pred[mask]
@@ -983,7 +931,7 @@ class FingerprintTrainer:
         return float(avg_loss), float(r2), float(rmse)
 
 def get_run_output_dir(prefix: Optional[str] = None) -> str:
-    """获取当前运行的输出目录，如果不存在则创建。"""
+
     base = RUN_OUTPUT_DIR if RUN_OUTPUT_DIR else OUT_DIR
     os.makedirs(base, exist_ok=True)
     if prefix:
@@ -994,12 +942,11 @@ def get_run_output_dir(prefix: Optional[str] = None) -> str:
 
 
 def cleanup_attention_output_images(output_dir: str) -> None:
-    """
-    清理旧的输出图片文件，保留特定的关键分析图表。
-    """
+
+
     if not output_dir or (not os.path.isdir(output_dir)):
         return
-    # 保留文件名的前缀列表
+
     keep_prefixes = (
         "pred_vs_true",
         "residual_hist",
@@ -1036,7 +983,7 @@ def cleanup_attention_output_images(output_dir: str) -> None:
 
 
 def _unwrap_dataset(ds):
-    """递归解包DataLoader中的数据集，获取最底层的原始数据集对象。"""
+
     cur = ds
     for _ in range(8):
         if isinstance(cur, SelectedFeatureSubset):
@@ -1049,7 +996,7 @@ def _unwrap_dataset(ds):
 
 
 def _get_fp_feature_labels(ds) -> Optional[list]:
-    """尝试获取指纹特征的名称标签（如fp_123）。"""
+
     cur = _unwrap_dataset(ds)
     if isinstance(cur, SelectedFeatureSubset) and getattr(cur, "feature_names", None):
         return list(cur.feature_names)
@@ -1064,30 +1011,28 @@ def _get_fp_feature_labels(ds) -> Optional[list]:
 
 
 def _bin_matrix(mat: np.ndarray, max_rows: int, max_cols: int):
-    """
-    对大矩阵进行分箱（Binning）缩减，以便于热力图可视化。
-    如果行/列超过最大限制，则合并相邻行/列取平均值。
-    """
+
+
     mat = np.asarray(mat, dtype=float)
     n_rows, n_cols = mat.shape
     row_bins = [np.array([i]) for i in range(n_rows)]
     col_bins = [np.array([j]) for j in range(n_cols)]
-    
-    # 行缩减
+
+
     if n_rows > max_rows:
         row_bins = np.array_split(np.arange(n_rows), max_rows)
         mat = np.vstack([mat[idx].mean(axis=0) for idx in row_bins])
-        
-    # 列缩减
+
+
     if n_cols > max_cols:
         col_bins = np.array_split(np.arange(n_cols), max_cols)
         mat = np.column_stack([mat[:, idx].mean(axis=1) for idx in col_bins])
-        
+
     return mat, row_bins, col_bins
 
 
 def _make_bin_labels(bins):
-    """生成分箱后的标签（例如 "1-5", "6-10"）。"""
+
     labels = []
     for idx in bins:
         start = int(idx[0]) + 1
@@ -1097,13 +1042,11 @@ def _make_bin_labels(bins):
 
 
 def _resolve_attention_model(model: nn.Module) -> Optional[nn.Module]:
-    """
-    解析并返回内部包含的注意力模型实例。
-    兼容直接传入或包装在DataParallel/DistributedDataParallel中的模型。
-    """
+
+
     if isinstance(model, (AttentionFingerprintTransformer, ChemistryAwareAttentionTransformer, ChemBiasAttentionRegressor)):
         return model
-    # 检查是否作为 expert 包含在混合模型中
+
     attn_expert = getattr(model, "attn_expert", None)
     if isinstance(attn_expert, (AttentionFingerprintTransformer, ChemistryAwareAttentionTransformer, ChemBiasAttentionRegressor)):
         return attn_expert
@@ -1111,14 +1054,12 @@ def _resolve_attention_model(model: nn.Module) -> Optional[nn.Module]:
 
 
 def _capture_attention_once(model: nn.Module, test_loader: DataLoader):
-    """
-    执行一次前向传播以捕获注意力权重。
-    需要设置 capture_attn 标志。
-    """
+
+
     attn_model = _resolve_attention_model(model)
     if attn_model is None:
         return None, None
-        
+
     device = next(attn_model.parameters()).device
     first_batch = None
     try:
@@ -1132,7 +1073,7 @@ def _capture_attention_once(model: nn.Module, test_loader: DataLoader):
                 _ = attn_model(fp, numeric)
                 first_batch = batch
                 break
-        # 恢复原始训练状态
+
         if was_training:
             attn_model.train()
     finally:
@@ -1141,26 +1082,24 @@ def _capture_attention_once(model: nn.Module, test_loader: DataLoader):
 
 
 def _token_labels_from_cache(attn_model: nn.Module, token_count_no_cls: int, fp_labels: Optional[list]) -> list:
-    """
-    从缓存中获取Token对应的指纹位ID，用于可视化标签。
-    对于稀疏Token模型，Token对应的是动态选择的Top-K指纹位。
-    """
+
+
     labels = [f"token_{i}" for i in range(token_count_no_cls)]
     idx_tensor = getattr(attn_model, "last_token_indices", None)
-    
+
     if idx_tensor is None:
         if fp_labels is not None and len(fp_labels) >= token_count_no_cls:
             return list(fp_labels[:token_count_no_cls])
         return labels
-        
+
     try:
         idx_np = idx_tensor.detach().cpu().numpy()
-        # 验证形状
+
         if idx_np.ndim != 2 or idx_np.shape[1] != token_count_no_cls:
             return labels
-            
+
         out = []
-        # 对每个位置的Token，取Batch中出现频率最高的指纹位ID作为代表
+
         for j in range(idx_np.shape[1]):
             col = idx_np[:, j].astype(int)
             if col.size == 0:
@@ -1178,15 +1117,13 @@ def _token_labels_from_cache(attn_model: nn.Module, token_count_no_cls: int, fp_
 
 
 def plot_pred_vs_true_and_residuals(y_true: np.ndarray, y_pred: np.ndarray, prefix: str) -> None:
-    """
-    绘制预测值vs真实值的散点图（带有密度着色），以及残差直方图。
-    包括边缘分布直方图。
-    """
+
+
     out_dir = get_run_output_dir(prefix)
     y_true = np.asarray(y_true, dtype=float).reshape(-1)
     y_pred = np.asarray(y_pred, dtype=float).reshape(-1)
-    
-    # 过滤无效值
+
+
     mask = np.isfinite(y_true) & np.isfinite(y_pred)
     y_true = y_true[mask]
     y_pred = y_pred[mask]
@@ -1197,7 +1134,7 @@ def plot_pred_vs_true_and_residuals(y_true: np.ndarray, y_pred: np.ndarray, pref
     y = y_pred.copy()
     err = np.abs(y - x)
 
-    # 计算高斯核密度估计（Gaussian KDE）用于点着色
+
     if gaussian_kde is not None and x.size > 5:
         try:
             xy = np.vstack([x, y])
@@ -1207,14 +1144,14 @@ def plot_pred_vs_true_and_residuals(y_true: np.ndarray, y_pred: np.ndarray, pref
     else:
         density = np.ones_like(x, dtype=float)
 
-    # 按密度排序，确保高密度点绘制在顶层
+
     order = np.argsort(density)
     x = x[order]
     y = y[order]
     err = err[order]
     density = density[order]
 
-    # 颜色映射设置
+
     cmax = float(np.nanpercentile(err, 98)) if err.size > 0 else 1.0
     if not np.isfinite(cmax) or cmax <= 1e-12:
         cmax = float(np.nanmax(err) + 1e-9) if err.size > 0 else 1.0
@@ -1222,15 +1159,15 @@ def plot_pred_vs_true_and_residuals(y_true: np.ndarray, y_pred: np.ndarray, pref
     cmap = mpl.cm.get_cmap("rainbow_r")
     rgba = cmap(norm(err))
 
-    # 根据密度调整透明度/白度
+
     dmin = float(np.nanmin(density)) if density.size > 0 else 0.0
     dmax = float(np.nanmax(density)) if density.size > 0 else 1.0
     dscale = (density - dmin) / max(dmax - dmin, 1e-12)
-    whiten = (1.0 - dscale) * 0.72  # 低密度点变亮（更白）
+    whiten = (1.0 - dscale) * 0.72
     rgba[:, :3] = rgba[:, :3] * (1.0 - whiten[:, None]) + 1.0 * whiten[:, None]
     rgba[:, 3] = 0.92
 
-    # 坐标轴范围设置
+
     all_min = float(min(np.min(x), np.min(y)))
     all_max = float(max(np.max(x), np.max(y)))
     margin = 0.03 * (all_max - all_min) if all_max > all_min else 1.0
@@ -1241,7 +1178,7 @@ def plot_pred_vs_true_and_residuals(y_true: np.ndarray, y_pred: np.ndarray, pref
     bin_w = float(edges[1] - edges[0])
     grid = np.linspace(lo, hi, 500)
 
-    # 创建带有边缘直方图的复杂布局
+
     fig = plt.figure(figsize=(8.8, 6.9), dpi=130)
     gs = fig.add_gridspec(
         2,
@@ -1258,16 +1195,16 @@ def plot_pred_vs_true_and_residuals(y_true: np.ndarray, y_pred: np.ndarray, pref
     ax_blank = fig.add_subplot(gs[0, 1])
     ax_blank.axis("off")
 
-    # 主散点图
+
     ax_main.scatter(x, y, s=26, c=rgba, edgecolors="none")
-    ax_main.plot([lo, hi], [lo, hi], "--", color="red", linewidth=1.4, alpha=0.9)  # y=x 参考线
+    ax_main.plot([lo, hi], [lo, hi], "--", color="red", linewidth=1.4, alpha=0.9)
     ax_main.set_xlim(lo, hi)
     ax_main.set_ylim(lo, hi)
     ax_main.set_xlabel("True logk")
     ax_main.set_ylabel("Predicted logk")
     ax_main.grid(alpha=0.2)
 
-    # 顶部边缘直方图 (True / Pred 在 True-logk 轴上的分布)
+
     ax_top.hist(y_true, bins=edges, color="#6BAED6", alpha=0.45, label="True")
     ax_top.hist(y_pred, bins=edges, color="#FDB37C", alpha=0.45, label="Pred")
     if gaussian_kde is not None and y_true.size > 5:
@@ -1281,7 +1218,7 @@ def plot_pred_vs_true_and_residuals(y_true: np.ndarray, y_pred: np.ndarray, pref
     ax_top.legend(loc="upper right", fontsize=9, frameon=True)
     ax_top.grid(alpha=0.15)
 
-    # 右侧边缘直方图
+
     ax_right.hist(y_true, bins=edges, orientation="horizontal", color="#6BAED6", alpha=0.45)
     ax_right.hist(y_pred, bins=edges, orientation="horizontal", color="#FDB37C", alpha=0.45)
     if gaussian_kde is not None and y_true.size > 5:
@@ -1294,7 +1231,7 @@ def plot_pred_vs_true_and_residuals(y_true: np.ndarray, y_pred: np.ndarray, pref
     ax_right.tick_params(axis="y", labelleft=False)
     ax_right.grid(alpha=0.15)
 
-    # 误差颜色条
+
     sm = mpl.cm.ScalarMappable(norm=norm, cmap=cmap)
     sm.set_array([])
     cbar = fig.colorbar(sm, cax=ax_cbar)
@@ -1304,7 +1241,7 @@ def plot_pred_vs_true_and_residuals(y_true: np.ndarray, y_pred: np.ndarray, pref
     _savefig_with_pdf(fig, os.path.join(out_dir, "pred_vs_true.png"), dpi=300, bbox_inches="tight")
     plt.close(fig)
 
-    # 残差直方图
+
     residual = y_pred - y_true
     plt.figure(figsize=(6.0, 4.0))
     plt.hist(residual, bins=30, color="#0F766E", alpha=0.85)
@@ -1323,16 +1260,14 @@ def plot_train_test_vs_true_with_band(
     y_test_pred: np.ndarray,
     prefix: str,
 ) -> None:
-    """
-    绘制训练集和测试集的对比图，包含误差带。
-    左图为训练集，右图为测试集。
-    """
+
+
     out_dir = get_run_output_dir(prefix)
     y_train_true = np.asarray(y_train_true, dtype=float).reshape(-1)
     y_train_pred = np.asarray(y_train_pred, dtype=float).reshape(-1)
     y_test_true = np.asarray(y_test_true, dtype=float).reshape(-1)
     y_test_pred = np.asarray(y_test_pred, dtype=float).reshape(-1)
-    
+
     tr_mask = np.isfinite(y_train_true) & np.isfinite(y_train_pred)
     te_mask = np.isfinite(y_test_true) & np.isfinite(y_test_pred)
     y_train_true = y_train_true[tr_mask]
@@ -1346,8 +1281,8 @@ def plot_train_test_vs_true_with_band(
     rmse_train = float(np.sqrt(mean_squared_error(y_train_true, y_train_pred)))
     r2_test = float(r2_score(y_test_true, y_test_pred))
     rmse_test = float(np.sqrt(mean_squared_error(y_test_true, y_test_pred)))
-    
-    # 计算80%分位数的绝对误差作为误差带宽度
+
+
     band = float(np.quantile(np.abs(y_test_pred - y_test_true), 0.80)) if y_test_true.size > 0 else 0.0
 
     all_true = np.concatenate([y_train_true, y_test_true])
@@ -1572,16 +1507,15 @@ def plot_train_density_test_overlay(
 
 
 def plot_category_metrics_paper(y_true: np.ndarray, y_pred: np.ndarray, y_cat_labels: np.ndarray, prefix: str) -> None:
-    """
-    绘制特定于类别的性能指标（R2和RMSE），生成用于论文发表的高质量图表。
-    """
+
+
     out_dir = get_run_output_dir(prefix)
     y_true = np.asarray(y_true, dtype=float).reshape(-1)
     y_pred = np.asarray(y_pred, dtype=float).reshape(-1)
     y_cat_labels = np.asarray(y_cat_labels).reshape(-1)
     if y_true.size != y_pred.size or y_true.size != y_cat_labels.size:
         return
-        
+
     mask = np.isfinite(y_true) & np.isfinite(y_pred)
     y_true = y_true[mask]
     y_pred = y_pred[mask]
@@ -1589,11 +1523,11 @@ def plot_category_metrics_paper(y_true: np.ndarray, y_pred: np.ndarray, y_cat_la
     if y_true.size < 20:
         return
 
-    # 设置每个类别的最小样本数阈值，默认为5
+
     min_n = int(max(4, int(_env_value("TRANSFORMER_CATEGORY_METRICS_MIN_N", None, 5))))
     rows = []
-    
-    # 遍历每个类别计算指标
+
+
     for c in np.unique(y_cat_labels):
         m = y_cat_labels == c
         n = int(np.sum(m))
@@ -1613,7 +1547,7 @@ def plot_category_metrics_paper(y_true: np.ndarray, y_pred: np.ndarray, y_cat_la
     if not rows:
         return
 
-    # 按R2降序、RMSE升序排序
+
     rows.sort(key=lambda row: (float(row.get("r2", float("-inf"))), -float(row.get("rmse", float("inf")))), reverse=True)
     labels = [str(row["category"]) for row in rows]
     n_vals = np.asarray([int(row["n"]) for row in rows], dtype=int)
@@ -1621,7 +1555,7 @@ def plot_category_metrics_paper(y_true: np.ndarray, y_pred: np.ndarray, y_cat_la
     rmse_vals = np.asarray([float(row["rmse"]) for row in rows], dtype=float)
     y_pos = np.arange(len(rows), dtype=float)
 
-    # 动态调整图形宽度
+
     fig_w = max(13.4, 10.4 + 0.50 * len(rows))
     fig, (ax_r2, ax_rmse) = plt.subplots(
         1,
@@ -1638,17 +1572,17 @@ def plot_category_metrics_paper(y_true: np.ndarray, y_pred: np.ndarray, y_cat_la
         ax.spines["right"].set_visible(False)
         ax.spines["left"].set_color("#D1D5DB")
         ax.spines["bottom"].set_color("#D1D5DB")
-        # 绘制交替背景色带
+
         for yi in y_pos:
             ax.axhspan(yi - 0.5, yi + 0.5, color="#F8FAFC" if int(yi) % 2 == 0 else "#FFFFFF", zorder=0)
 
-    # 目标参考线
+
     r2_thr = float(_env_value("TRANSFORMER_CATEGORY_R2_TARGET", None, 0.80))
     rmse_thr = float(_env_value("TRANSFORMER_CATEGORY_RMSE_TARGET", None, 1.20))
     mean_r2 = float(np.nanmean(r2_vals))
     mean_rmse = float(np.nanmean(rmse_vals))
 
-    # 绘制参考区域和均值线
+
     ax_r2.axvspan(r2_thr, max(1.0, float(np.nanmax(r2_vals) + 0.03)), color="#ECFDF5", alpha=0.9, zorder=0)
     ax_r2.axvline(r2_thr, color="#059669", linestyle="--", linewidth=1.6, alpha=0.95)
     ax_rmse.axvspan(0.0, rmse_thr, color="#EFF6FF", alpha=0.9, zorder=0)
@@ -1658,11 +1592,11 @@ def plot_category_metrics_paper(y_true: np.ndarray, y_pred: np.ndarray, y_cat_la
 
     r2_colors = ["#0F766E" if v >= r2_thr else "#94A3B8" for v in r2_vals]
     rmse_colors = ["#2563EB" if v <= rmse_thr else "#DC2626" for v in rmse_vals]
-    # 气泡大小与样本量n成正比
+
     size_scale = 22 + 1.6 * np.sqrt(np.clip(n_vals, 1, None))
     stem_r2_start = min(r2_thr - 0.12, float(np.nanmin(r2_vals) - 0.03))
 
-    # 绘制棒棒糖图（Lollipop plot）
+
     for y, v, color in zip(y_pos, r2_vals, r2_colors):
         ax_r2.hlines(y, xmin=stem_r2_start, xmax=v, color="#CBD5E1", linewidth=2.6, zorder=1)
         ax_r2.scatter([v], [y], s=float(size_scale[int(y)] * 4.6), color=color, edgecolors="white", linewidths=1.1, zorder=3)
@@ -1684,7 +1618,7 @@ def plot_category_metrics_paper(y_true: np.ndarray, y_pred: np.ndarray, y_cat_la
     ax_r2.set_xlim(r2_xmin, r2_xmax)
     ax_rmse.set_xlim(0.0, max(rmse_thr + 0.1, float(np.nanmax(rmse_vals) + 0.10)))
 
-    # 添加数值标签
+
     for y, v, n in zip(y_pos, r2_vals, n_vals):
         ax_r2.text(
             v + 0.008,
@@ -1740,7 +1674,7 @@ def plot_category_metrics_paper(y_true: np.ndarray, y_pred: np.ndarray, y_cat_la
 
 
 class _FGDef:
-    """定义功能基团（Functional Group）的辅助类，用于子结构匹配。"""
+
     def __init__(self, name: str, smarts: str, display: str, highlight_idx: list, color=(0.95, 0.80, 0.85)):
         self.name = name
         self.smarts = smarts
@@ -1929,9 +1863,8 @@ def _is_informative_substructure(smi: str, min_atoms: int = 2) -> bool:
 
 
 def _detect_functional_group(sub_smiles: str) -> Optional[Dict[str, object]]:
-    """
-    检测给定的子结构SMILES是否匹配已知的官能团。
-    """
+
+
     if not sub_smiles or str(sub_smiles).startswith("Unknown"):
         return None
     mol = None
@@ -1980,7 +1913,7 @@ def _functional_group_def_by_name(name: str) -> Optional[_FGDef]:
 
 
 def _pretty_category_label(label: object) -> str:
-    """美化化学类别标签，去除前缀并转换为可读名称。"""
+
     raw = str(label).strip()
     if raw.startswith("cat_"):
         raw = raw.replace("cat_", "", 1)
@@ -1996,22 +1929,12 @@ def _aggregate_functional_group_impacts(
     sample_indices: np.ndarray,
     top_n: int = 10,
 ) -> list:
-    """
-    聚合位（Bit）层面的影响，映射到功能基团层面。
-    
-    参数:
-        bit_rows: 包含位分析结果的列表（通常来自前面的分析步骤）
-        dataset: 数据集对象
-        sample_indices: 样本索引
-        top_n: 返回的Top-N基团数量
-        
-    返回:
-        按重要性排序的功能基团统计信息列表。
-    """
+
+
     if not bit_rows:
         return []
     sample_idx = np.asarray(sample_indices, dtype=int).reshape(-1)
-    # 确保索引有效
+
     sample_idx = sample_idx[(sample_idx >= 0) & (sample_idx < len(dataset))]
     if sample_idx.size == 0:
         return []
@@ -2022,13 +1945,13 @@ def _aggregate_functional_group_impacts(
         return []
 
     group_map: Dict[str, Dict[str, object]] = {}
-    
-    # 遍历每个特征位的结果，聚合到功能基团
+
+
     for row in bit_rows:
         fg_name = str(row.get("functional_group", "")).strip()
         if not fg_name:
             continue
-            
+
         item = group_map.setdefault(
             fg_name,
             {
@@ -2050,38 +1973,38 @@ def _aggregate_functional_group_impacts(
                 "row_count": 0,
             },
         )
-        
-        # 填充基团定义信息
+
+
         fg_def = _functional_group_def_by_name(fg_name)
         if fg_def is not None and (not item.get("smarts")):
             item["smarts"] = str(fg_def.smarts)
         if str(row.get("functional_display", "")).strip() and (not item.get("functional_display")):
             item["functional_display"] = str(row.get("functional_display", "")).strip()
-            
+
         bit_name = str(row.get("bit_name", "")).strip()
         bit_idx = _parse_fp_bit_index(bit_name)
         if bit_name:
             item["bit_names"].add(bit_name)
         if bit_idx is not None:
             item["bits"].add(int(bit_idx))
-            
-        # 记录具体的子结构SMILES
+
+
         sub = str(row.get("substructure_smiles", "")).strip()
         if sub and (not sub.startswith("Unknown")):
             item["substructures"][sub] += int(max(1, int(row.get("substructure_count", 0))))
 
-        # 计算综合证据分数
+
         evidence_score = float(row.get("consensus_score", 0.0))
         if evidence_score <= 0.0:
-            # 如果没有预先计算的一致性分数，则手动加权计算
+
             evidence_score = (
                 0.35 * float(row.get("attention_score", 0.0))
                 + 0.25 * float(row.get("ig_score", 0.0))
                 + 0.25 * float(row.get("perturb_score", 0.0))
                 + 0.15 * float(row.get("stability_score", 0.0))
             )
-            
-        # 累加各项分数
+
+
         item["functional_score_sum"] += float(max(0.0, evidence_score))
         item["attention_score_sum"] += float(row.get("attention_score", 0.0))
         item["ig_score_sum"] += float(row.get("ig_score", 0.0))
@@ -2094,30 +2017,30 @@ def _aggregate_functional_group_impacts(
         item["row_count"] += 1
 
     rows = []
-    # 计算每个聚合基团的统计指标（如Delta logk）
+
     for fg_name, item in group_map.items():
         bits = sorted(int(b) for b in item.get("bits", set()) if 0 <= int(b) < fp_np.shape[1])
         if not bits:
             continue
-            
-        # 确定哪些样本激活了该基团对应的任意一个位
+
+
         active_mask = (np.abs(fp_np[np.asarray(sample_idx, dtype=int)][:, bits]) > 1e-6).any(axis=1)
         active_mask = np.asarray(active_mask, dtype=bool).reshape(-1)
         if active_mask.size != sample_idx.size:
             continue
-            
+
         active_y = y_np[sample_idx][active_mask]
         inactive_y = y_np[sample_idx][~active_mask]
-        
-        # 计算 logk 差异（基团存在与否对 logk 的影响）
+
+
         delta_logk = float(np.nanmean(active_y) - np.nanmean(inactive_y)) if active_y.size > 0 and inactive_y.size > 0 else 0.0
         active_mean = float(np.nanmean(active_y)) if active_y.size > 0 else float("nan")
         inactive_mean = float(np.nanmean(inactive_y)) if inactive_y.size > 0 else float("nan")
         support_n = int(active_mask.sum())
         direction = "positive" if delta_logk > 1e-6 else ("negative" if delta_logk < -1e-6 else "neutral")
-        
+
         examples = [str(smi) for smi, _ in item.get("substructures", Counter()).most_common(3)]
-        
+
         rows.append(
             {
                 "functional_group": str(fg_name),
@@ -2145,7 +2068,7 @@ def _aggregate_functional_group_impacts(
             }
         )
 
-    # 排序：优先按功能分数，其次按delta_logk绝对值
+
     rows.sort(
         key=lambda row: (
             float(row.get("functional_score_sum", 0.0)),
@@ -2159,9 +2082,8 @@ def _aggregate_functional_group_impacts(
 
 
 def _plot_top_functional_groups(functional_rows: list, output_dir: str, artifact_tag: str = "attn", top_n: int = 10) -> None:
-    """
-    绘制Top-N功能基团的条形图，展示其重要性分数和对logk的影响（Delta logk）。
-    """
+
+
     rows = list(functional_rows[: int(max(1, top_n))])
     if not rows:
         return
@@ -2171,7 +2093,7 @@ def _plot_top_functional_groups(functional_rows: list, output_dir: str, artifact
     delta_vals = []
     support_vals = []
     bit_counts = []
-    
+
     for row in rows:
         fg_name = str(row.get("functional_group", "")).strip() or "Unassigned"
         fg_display = str(row.get("functional_display", "")).strip()
@@ -2183,8 +2105,8 @@ def _plot_top_functional_groups(functional_rows: list, output_dir: str, artifact
 
     y_pos = np.arange(len(rows))
     fig_h = max(7.0, min(12.5, 2.0 + 0.60 * len(rows)))
-    
-    # 双子图：左侧为重要性分数，右侧为Delta logk
+
+
     fig, (ax_score, ax_delta) = plt.subplots(
         ncols=2,
         figsize=(13.8, fig_h),
@@ -2195,15 +2117,15 @@ def _plot_top_functional_groups(functional_rows: list, output_dir: str, artifact
 
     score_arr = np.asarray(score_vals, dtype=np.float32)
     delta_arr = np.asarray(delta_vals, dtype=np.float32)
-    
-    # 颜色映射
+
+
     score_norm = mpl.colors.Normalize(vmin=float(score_arr.min()), vmax=float(score_arr.max() + 1e-12))
     score_colors = [mpl.cm.get_cmap("YlOrRd")(score_norm(v)) for v in score_arr]
     delta_lim = float(max(np.max(np.abs(delta_arr)), 1e-6))
     delta_norm = mpl.colors.TwoSlopeNorm(vmin=-delta_lim, vcenter=0.0, vmax=delta_lim)
     delta_colors = [mpl.cm.get_cmap("coolwarm")(delta_norm(v)) for v in delta_arr]
 
-    # 绘制左侧分数条形图
+
     ax_score.set_facecolor("white")
     ax_delta.set_facecolor("white")
     ax_score.barh(y_pos, score_arr, color=score_colors, edgecolor="#7C2D12", linewidth=0.7)
@@ -2231,7 +2153,7 @@ def _plot_top_functional_groups(functional_rows: list, output_dir: str, artifact
     ax_delta.tick_params(axis="y", left=False, labelleft=False)
     ax_delta.set_xlim(-delta_lim * 1.28, delta_lim * 1.28)
 
-    # 在条形图上添加详细文本标签
+
     for y, score_v, delta_v, support_n, bit_n, row in zip(y_pos, score_arr, delta_arr, support_vals, bit_counts, rows):
         ax_score.text(
             score_v + max(0.004, x_max * 0.012),
@@ -2273,7 +2195,7 @@ def _plot_top_functional_groups(functional_rows: list, output_dir: str, artifact
 
 
 def _load_first_matching_csv(pattern: str) -> Optional[pd.DataFrame]:
-    """尝试加载匹配glob模式的第一个CSV文件。"""
+
     matches = sorted(glob.glob(pattern))
     if not matches:
         return None
@@ -2284,7 +2206,7 @@ def _load_first_matching_csv(pattern: str) -> Optional[pd.DataFrame]:
 
 
 def _cleanup_legacy_functional_group_outputs(output_dir: str, keep_top_n: int = 10) -> None:
-    """清理旧的功能基团分析输出文件，只保留当前Top-N的。"""
+
     if not output_dir or (not os.path.isdir(output_dir)):
         return
     patterns = [
@@ -2314,7 +2236,7 @@ def _cleanup_legacy_functional_group_outputs(output_dir: str, keep_top_n: int = 
 
 
 def _collect_functional_group_structure_rows(output_dir: str, top_n: int = 10) -> list:
-    """收集功能基团结构信息，用于后续生成结构图。"""
+
     rows = []
     seen = set()
     consensus_df = _load_first_matching_csv(os.path.join(output_dir, "consensus_top*_functional_groups_detailed.csv"))
@@ -2366,7 +2288,7 @@ def _collect_functional_group_structure_rows(output_dir: str, top_n: int = 10) -
 
 
 def _supplement_functional_group_rows(base_rows: list, output_dir: str, top_n: int = 10) -> list:
-    """补充功能基团行数据，确保列表至少有Top-N个条目。"""
+
     rows = [dict(r) for r in list(base_rows or [])]
     seen = {str(r.get("functional_group", "")).strip() for r in rows if str(r.get("functional_group", "")).strip()}
     if len(rows) >= int(top_n):
@@ -2408,7 +2330,7 @@ def _supplement_functional_group_rows(base_rows: list, output_dir: str, top_n: i
         if len(rows) >= int(top_n):
             break
 
-    # 如果仍然不足 Top-N，使用预定义的模板补充
+
     if len(rows) < int(top_n):
         template_priority = [
             "Phenol",
@@ -2447,29 +2369,25 @@ def _supplement_functional_group_rows(base_rows: list, output_dir: str, top_n: i
 
 
 def _pick_functional_group_structure(functional_group: str, example_substructures: str = "", smarts: str = ""):
-    """
-    选择用于可视化的最佳功能基团结构。
-    
-    返回:
-        (RDKit Mol对象, 高亮原子索引列表, 显示用的SMILES/SMARTS字符串)
-    """
+
+
     fg_name = str(functional_group).strip()
     fg_def = _functional_group_def_by_name(fg_name)
     pat = fg_def.pattern if fg_def is not None else None
     candidates = []
-    
-    # 优先使用代表性SMILES
+
+
     rep = str(FG_REPRESENTATIVE_SMILES.get(fg_name, "")).strip()
     if rep:
         candidates.append(rep)
-        
-    # 其次尝试从example_substructures中提取
+
+
     for token in str(example_substructures).split("|"):
         tok = str(token).strip()
         if tok:
             candidates.append(tok)
-            
-    # 尝试从候选列表中生成Mol对象
+
+
     for smi in candidates:
         try:
             mol = Chem.MolFromSmiles(smi)
@@ -2486,8 +2404,8 @@ def _pick_functional_group_structure(functional_group: str, example_substructure
             if matches:
                 highlight = list(matches[0])
         return mol, highlight, smi
-        
-    # 如果都失败了，尝试直接使用SMARTS
+
+
     if smarts:
         try:
             q = Chem.MolFromSmarts(smarts)
@@ -2499,9 +2417,8 @@ def _pick_functional_group_structure(functional_group: str, example_substructure
 
 
 def _plot_top_functional_group_structures(output_dir: str, top_n: int = 10) -> Optional[str]:
-    """
-    绘制Top-N功能基团的结构网格图。
-    """
+
+
     rows = _collect_functional_group_structure_rows(output_dir=output_dir, top_n=top_n)
     rows = _supplement_functional_group_rows(rows, output_dir=output_dir, top_n=top_n)
     if not rows:
@@ -2528,14 +2445,14 @@ def _plot_top_functional_group_structures(output_dir: str, top_n: int = 10) -> O
         fg_name = str(row.get("functional_group", "")).strip() or "Unknown"
         fg_display = str(row.get("functional_display", "")).strip()
         smarts = str(row.get("smarts", "")).strip()
-        
+
         mol, highlight_atoms, shown_smi = _pick_functional_group_structure(
             functional_group=fg_name,
             example_substructures=str(row.get("example_substructures", "")),
             smarts=smarts,
         )
-        
-        # 绘制分子结构
+
+
         if mol is not None:
             try:
                 img = Draw.MolToImage(
@@ -2589,10 +2506,8 @@ def _plot_top_functional_group_structures(output_dir: str, top_n: int = 10) -> O
 
 
 def _substructure_quality_metrics(sub_smiles: str, min_heavy_atoms: int = 3) -> Dict[str, object]:
-    """
-    计算子结构的质量指标（有效性、原子数、官能团等）。
-    用于评估一个子结构是否是一个"有意义"的化学片段。
-    """
+
+
     canonical = _canonicalize_smiles_or_smarts(sub_smiles)
     metrics: Dict[str, object] = {
         "valid": False,
@@ -2618,7 +2533,7 @@ def _substructure_quality_metrics(sub_smiles: str, min_heavy_atoms: int = 3) -> 
             mol = Chem.MolFromSmarts(canonical)
         if mol is None:
             return metrics
-            
+
         atoms = list(mol.GetAtoms())
         heavy_atoms = int(mol.GetNumHeavyAtoms())
         halogen_atoms = int(sum(atom.GetAtomicNum() in {9, 17, 35, 53} for atom in atoms))
@@ -2628,10 +2543,10 @@ def _substructure_quality_metrics(sub_smiles: str, min_heavy_atoms: int = 3) -> 
         ring_info = mol.GetRingInfo()
         ring_count = int(ring_info.NumRings()) if ring_info is not None else 0
         unsat_bonds = int(sum((bond.GetBondTypeAsDouble() > 1.1) or bond.GetIsAromatic() for bond in mol.GetBonds()))
-        
-        # 尝试识别该子结构对应的功能基团
+
+
         fg = _detect_functional_group(canonical)
-        
+
         halogen_only = heavy_atoms > 0 and heavy_atoms == halogen_atoms
         all_aliphatic_carbon = (
             heavy_atoms > 0
@@ -2641,8 +2556,8 @@ def _substructure_quality_metrics(sub_smiles: str, min_heavy_atoms: int = 3) -> 
             and halogen_atoms == 0
         )
         exact_trivial = canonical in TRIVIAL_SUBSTRUCTURE_EXACT
-        
-        # 判断子结构是否是"琐碎"的（如单个原子、太小、无特征等）
+
+
         is_trivial = bool(
             exact_trivial
             or metrics["disconnected"]
@@ -2687,15 +2602,14 @@ def _score_substructure_candidate(
     mol_count: int,
     min_heavy_atoms: int = 3,
 ) -> Dict[str, object]:
-    """
-    对候选子结构进行评分，以选择最具代表性和化学意义的子结构。
-    """
+
+
     quality = _substructure_quality_metrics(sub_smiles, min_heavy_atoms=min_heavy_atoms)
     fg = quality.get("fg")
-    
-    # 启发式评分规则
+
+
     score = 0.0
-    score += 8.0 if fg is not None else 0.0  # 对应已知功能基团加分
+    score += 8.0 if fg is not None else 0.0
     score += 1.35 * float(quality.get("heavy_atoms", 0))
     score += 1.25 * float(quality.get("hetero_non_halogen", 0))
     score += 0.55 * float(quality.get("ring_count", 0))
@@ -2704,15 +2618,15 @@ def _score_substructure_candidate(
     score += 3.20 * float(sub_frac)
     score += 0.45 * float(np.log1p(max(int(sub_count), 0)))
     score += 0.25 * float(np.log1p(max(int(mol_count), 0)))
-    
-    # 惩罚项
+
+
     if bool(quality.get("is_trivial", True)):
         score -= 9.0
     if bool(quality.get("halogen_only", False)):
         score -= 6.0
     if bool(quality.get("all_aliphatic_carbon", False)) and int(quality.get("heavy_atoms", 0)) <= 4:
         score -= 5.0
-        
+
     return {
         "canonical_substructure": str(quality.get("canonical", sub_smiles)),
         "quality": quality,
@@ -2730,17 +2644,17 @@ def _choose_best_substructure_for_bit(
     info: Dict[str, object],
     min_heavy_atoms: int = 3,
 ) -> Optional[Dict[str, object]]:
-    """为特定的指纹位选择最佳的代表性子结构。"""
+
     rows = list(info.get("substructures", []) or [])
     if not rows:
         return None
-        
+
     candidates = []
     for row in rows:
         sub = str(row.get("substructure_smiles", "Unknown"))
         cnt = int(row.get("substructure_count", 0))
         frac = float(row.get("substructure_frac", 0.0))
-        
+
         scored = _score_substructure_candidate(
             sub_smiles=sub,
             sub_count=cnt,
@@ -2748,7 +2662,7 @@ def _choose_best_substructure_for_bit(
             mol_count=int(info.get("mol_count", 0)),
             min_heavy_atoms=min_heavy_atoms,
         )
-        
+
         candidate = {
             "rank": int(rank),
             "bit": int(bit),
@@ -2766,11 +2680,11 @@ def _choose_best_substructure_for_bit(
             "quality": dict(scored["quality"]),
         }
         candidates.append(candidate)
-        
+
     if not candidates:
         return None
-        
-    # 排序：优先合理的，其次按分数
+
+
     candidates.sort(
         key=lambda row: (
             int(bool(row.get("is_reasonable", False))),
@@ -2785,7 +2699,7 @@ def _choose_best_substructure_for_bit(
 
 
 def _select_unique_substructure_candidates(candidates: list, top_n: int) -> list:
-    """从候选列表中选择唯一的子结构，避免重复展示相似结构。"""
+
     ordered = sorted(
         list(candidates),
         key=lambda row: (
@@ -2799,7 +2713,7 @@ def _select_unique_substructure_candidates(candidates: list, top_n: int) -> list
     deferred = []
     seen_sub = set()
     seen_fg = set()
-    
+
     for row in ordered:
         canonical = str(row.get("canonical_substructure", ""))
         if (not canonical) or canonical in seen_sub or (not bool(row.get("is_reasonable", False))):
@@ -2841,7 +2755,7 @@ def _select_unique_substructure_candidates(candidates: list, top_n: int) -> list
 
 
 def _parse_fp_bit_index(bit_name: str) -> Optional[int]:
-    """从特征名称（如 'fp_123'）中解析位索引。"""
+
     if not isinstance(bit_name, str):
         return None
     s = str(bit_name).strip()
@@ -2861,16 +2775,14 @@ def _map_bits_to_substructures_cached(
     cache_tag: str = "",
     sample_indices: Optional[np.ndarray] = None,
 ) -> Dict[int, Dict[str, object]]:
-    """
-    缓存版本的位-子结构映射函数。
-    计算给定位（bits）在数据集中对应的最常见化学子结构。
-    """
+
+
     smiles_arr = np.asarray(smiles_list, dtype=object).reshape(-1)
     bit_list = sorted({int(b) for b in bits if b is not None})
     idx_arr = np.asarray(sample_indices if sample_indices is not None else np.arange(smiles_arr.size), dtype=int).reshape(-1)
     idx_arr = idx_arr[(idx_arr >= 0) & (idx_arr < smiles_arr.size)]
-    
-    # 构建缓存键
+
+
     cache_key = (str(cache_tag), int(fp_size), int(radius), tuple(bit_list), tuple(idx_arr.tolist()))
     cached = BIT_SUBSTRUCTURE_CACHE.get(cache_key)
     if cached is not None:
@@ -2882,7 +2794,7 @@ def _map_bits_to_substructures_cached(
     occ_count_map = {b: 0 for b in bit_list}
     mols_with = {b: [] for b in bit_list}
 
-    # 遍历分子，提取指纹位对应的环境
+
     for idx in idx_arr.tolist():
         smi = str(smiles_arr[idx])
         try:
@@ -2899,7 +2811,7 @@ def _map_bits_to_substructures_cached(
                 envs = bit_info[b]
                 occ_count_map[b] += int(len(envs))
                 for center, rad_local in envs:
-                    # 提取原子环境作为子结构SMILES
+
                     frag = _env_smiles_from_center(mol, center, rad_local)
                     if frag:
                         can = _canonicalize_smiles_or_smarts(frag)
@@ -2923,7 +2835,7 @@ def _map_bits_to_substructures_cached(
                     }
                 )
         else:
-            # 如果没有找到常见子结构，尝试计算MCS（最大公共子结构）或回退策略
+
             rep = "Unknown"
             try:
                 if len(mols_with[b]) >= 2:
@@ -2963,10 +2875,8 @@ def export_attention_substructure_artifacts(
     artifact_tag: str = "attn",
     extra_bit_metrics: Optional[Dict[str, Dict[str, object]]] = None,
 ) -> Dict[str, object]:
-    """
-    导出注意力机制关注的子结构分析报告。
-    包括生成CSV统计文件和可视化图表。
-    """
+
+
     out_dir = get_run_output_dir(prefix)
     train_idx = np.asarray(train_indices, dtype=int).reshape(-1)
     train_idx = train_idx[(train_idx >= 0) & (train_idx < len(dataset))]
@@ -3077,8 +2987,8 @@ def export_attention_substructure_artifacts(
                 }
             )
         pd.DataFrame(fg_rows).to_csv(os.path.join(out_dir, f"{artifact_tag}_top{top_n}_functional_groups.csv"), index=False, encoding="utf-8-sig")
-    
-    # 聚合功能基团影响并绘图
+
+
     functional_rows = _aggregate_functional_group_impacts(
         bit_rows=bit_rows,
         dataset=dataset,
@@ -3093,8 +3003,8 @@ def export_attention_substructure_artifacts(
         )
         _plot_top_functional_groups(functional_rows, out_dir, artifact_tag=artifact_tag, top_n=functional_top_n)
         _cleanup_legacy_functional_group_outputs(out_dir, keep_top_n=int(functional_top_n))
-    
-    # 选择并导出独特的原子团结构
+
+
     selected_candidates = _select_unique_substructure_candidates(rep_candidates, unique_top_n)
     export_unique_atom_groups = _env_bool("TRANSFORMER_EXPORT_UNIQUE_ATOM_GROUPS", False)
     if selected_candidates and export_unique_atom_groups:
@@ -3753,7 +3663,7 @@ def plot_attention_cls_and_category(model: nn.Module, test_loader: DataLoader, p
 
 
 def _minmax_scale_array(arr: np.ndarray) -> np.ndarray:
-    """将数组归一化到 [0, 1] 范围。"""
+
     x = np.asarray(arr, dtype=np.float32).reshape(-1)
     if x.size == 0:
         return x
@@ -3772,7 +3682,7 @@ def _minmax_scale_array(arr: np.ndarray) -> np.ndarray:
 
 
 def _row_normalize_nonnegative(mat: np.ndarray) -> np.ndarray:
-    """对矩阵进行行归一化（除以行和），确保非负。"""
+
     arr = np.asarray(mat, dtype=np.float32)
     if arr.ndim != 2 or arr.size == 0:
         return arr
@@ -3784,9 +3694,8 @@ def _row_normalize_nonnegative(mat: np.ndarray) -> np.ndarray:
 
 
 def _collect_explain_arrays(explain_loader: DataLoader, max_samples: Optional[int] = None) -> Dict[str, object]:
-    """
-    收集用于解释性分析的数据数组（指纹、数值特征、索引等）。
-    """
+
+
     feature_labels = _get_fp_feature_labels(explain_loader.dataset) or []
     fp_blocks = []
     num_blocks = []
@@ -3851,9 +3760,8 @@ def _collect_attention_sample_matrix_from_arrays(
     feature_labels: list,
     batch_size: int = 64,
 ) -> np.ndarray:
-    """
-    收集注意力分数矩阵，用于分析哪些指纹位被模型关注。
-    """
+
+
     attn_model = _resolve_attention_model(model)
     n_samples = int(np.asarray(fingerprint_np).shape[0])
     n_features = len(feature_labels)
@@ -3919,10 +3827,8 @@ def _integrated_gradients_fingerprint(
     numeric: torch.Tensor,
     steps: int = 8,
 ) -> torch.Tensor:
-    """
-    计算积分梯度（Integrated Gradients），用于归因特征重要性。
-    通过在基线（零向量）和输入之间插值，积分梯度能够更准确地反映特征对预测的贡献。
-    """
+
+
     steps = int(max(4, steps))
     baseline = torch.zeros_like(fingerprint)
     total_grad = torch.zeros_like(fingerprint)
@@ -3945,7 +3851,7 @@ def _collect_ig_sample_matrix_from_arrays(
     batch_size: int = 32,
     steps: int = 8,
 ) -> np.ndarray:
-    """收集积分梯度矩阵。"""
+
     n_samples = int(np.asarray(fingerprint_np).shape[0])
     n_features = int(np.asarray(fingerprint_np).shape[1]) if n_samples > 0 else 0
     out = np.zeros((n_samples, n_features), dtype=np.float32)
@@ -3975,10 +3881,8 @@ def _compute_mask_delta_scores_from_arrays(
     candidate_local_idx: list,
     batch_size: int = 64,
 ) -> Dict[int, Dict[str, float]]:
-    """
-    计算掩码扰动分数（Mask Delta Score）。
-    通过强制将某个特征置零，观察预测值的变化，评估该特征的重要性。
-    """
+
+
     out = {int(i): {"delta_sum": 0.0, "delta_count": 0, "delta_max": 0.0} for i in candidate_local_idx}
     n_samples = int(np.asarray(fingerprint_np).shape[0])
     if n_samples == 0 or not candidate_local_idx:
@@ -4023,10 +3927,8 @@ def _compute_bootstrap_stability_scores(
     topk: int = 10,
     seed: int = 42,
 ) -> Dict[int, float]:
-    """
-    计算Bootstrapping稳定性分数。
-    通过多次重采样数据，观察特征是否稳定地出现在Top-K中。
-    """
+
+
     candidate_local_idx = [int(i) for i in candidate_local_idx]
     out = {int(i): 0.0 for i in candidate_local_idx}
     mat = np.asarray(sample_score_matrix, dtype=np.float32)
@@ -4054,7 +3956,7 @@ def _compute_bootstrap_stability_scores(
 
 
 def _plot_consensus_top_motifs(consensus_rows: list, output_dir: str, top_n: int = 10) -> None:
-    """绘制综合Top-N基团的条形图。"""
+
     rows = list(consensus_rows[: int(max(1, top_n))])
     if not rows:
         return
@@ -4122,30 +4024,23 @@ def _build_model_for_mode(
     numeric_dim: int,
     cfg: FingerprintConfig,
 ) -> nn.Module:
-    """
-    根据模式构建模型实例 (Factory function to build model).
-    
-    参数:
-    - model_mode: "mlp" (基线) 或 "attn" (Transformer)
-    - fingerprint_dim: 输入指纹维度 (Top-K)
-    - numeric_dim: 数值特征维度
-    - cfg: 超参数配置对象
-    """
+
+
     mode = str(model_mode).strip().lower()
-    
+
     if mode == "mlp":
-        # 基线 MLP 模型 (Baseline MLP)
+
         return FingerprintTransformer(fingerprint_dim, numeric_dim, cfg)
-        
+
     if mode == "attn":
         return _build_attention_expert(fingerprint_dim, numeric_dim, cfg)
-        
-    # 默认回退到 MLP
+
+
     return FingerprintTransformer(fingerprint_dim, numeric_dim, cfg)
 
 
 def _build_cma_cfg_from_model(model: nn.Module) -> FingerprintConfig:
-    """从模型实例恢复配置对象 (Recover config from model instance)."""
+
     base_cfg = getattr(model, "config", None)
     cfg = FingerprintConfig()
     if base_cfg is not None:
@@ -4179,14 +4074,14 @@ def _build_cma_cfg_from_model(model: nn.Module) -> FingerprintConfig:
 
 
 def _set_global_random_seed(seed: int) -> None:
-    """设置全局随机种子以保证可复现性 (Set global random seed)."""
+
     seed = int(seed)
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    # 如果开启确定性模式 (可能变慢)
+
     if _env_bool("TRANSFORMER_DETERMINISTIC", False):
         try:
             torch.backends.cudnn.deterministic = True
@@ -4204,27 +4099,21 @@ def _make_selected_subsets_for_indices(
     topk_features: int,
     fp_select_method: str,
 ) -> Tuple[Dataset, Dataset, int]:
-    """
-    创建带特征选择的数据子集 (Create feature-selected subsets).
-    
-    流程:
-    1. 根据 train_idx 计算特征重要性排名 (Feature Ranking).
-    2. 选择 Top-K 个最重要的指纹位.
-    3. 创建 SelectedFeatureSubset，只保留这些位.
-    """
+
+
     use_topk = _env_bool_pair("TRANSFORMER_V3_USE_TOPK", "TRANSFORMER_V2_USE_TOPK", True)
     if use_topk:
-        # 获取特征排名 (仅使用训练集，避免泄露)
+
         rank = _get_fp_ranking(dataset, np.asarray(train_idx, dtype=int), int(fp_bits), str(fp_select_method))
         k = int(min(max(1, topk_features), dataset.fingerprint_dim))
         top_idx = rank[:k]
-        
-        # 创建只包含Top-K特征的子集
+
+
         train_subset = SelectedFeatureSubset(dataset, train_idx, top_idx)
         eval_subset = SelectedFeatureSubset(dataset, eval_idx, top_idx)
         return train_subset, eval_subset, int(k)
-        
-    # 如果不使用特征选择，返回原始子集
+
+
     return Subset(dataset, train_idx), Subset(dataset, eval_idx), int(dataset.fingerprint_dim)
 
 
@@ -4240,23 +4129,18 @@ def _train_stability_model_for_fold(
     fp_select_method: str,
     seed: int,
 ) -> Tuple[Optional[nn.Module], Optional[DataLoader]]:
-    """
-    训练用于稳定性分析的模型 (Train model for stability analysis).
-    
-    这是一个简化的训练流程，用于 Cross-Seed Stability Analysis。
-    不进行复杂的 Logging 或 Checkpointing，只返回训练好的模型用于验证。
-    """
+
 
     train_idx = np.asarray(train_idx, dtype=int).reshape(-1)
     hold_idx = np.asarray(hold_idx, dtype=int).reshape(-1)
     if train_idx.size < 16 or hold_idx.size < 8:
         return None, None
 
-    # 设置随机种子 (Set seed)
+
     _set_global_random_seed(int(seed))
     dataset.fit_scalers(train_idx)
-    
-    # 创建训练集和验证集 (Create splits)
+
+
     train_subset, hold_subset, fp_dim_for_model = _make_selected_subsets_for_indices(
         dataset=dataset,
         train_idx=train_idx,
@@ -4266,29 +4150,29 @@ def _train_stability_model_for_fold(
         fp_select_method=str(fp_select_method),
     )
 
-    # 复制配置并进行微调（为了速度，通常减少Epoch数）(Adjust config for speed)
+
     cfg = copy.deepcopy(cfg_base)
-    # 限制最大 Epoch 以加速稳定性评估
+
     cfg.max_epochs = int(_env_value("TRANSFORMER_CMA_STABILITY_MAX_EPOCHS", None, min(int(cfg.max_epochs), 80)))
-    # 减少 Early Stopping Patience
+
     cfg.early_stopping_patience = int(
         _env_value("TRANSFORMER_CMA_STABILITY_EARLY_STOP", None, min(int(cfg.early_stopping_patience), 20))
     )
-    # 调整 Batch Size
+
     cfg.batch_size = int(_env_value("TRANSFORMER_CMA_STABILITY_BATCH_SIZE", None, cfg.batch_size))
-    # 调整 Min Delta
+
     cfg.min_delta = float(_env_value("TRANSFORMER_CMA_STABILITY_MIN_DELTA", None, cfg.min_delta))
     if model_mode in {"dual", "attn"}:
         cfg.max_fp_tokens = min(int(cfg.max_fp_tokens), int(fp_dim_for_model))
     cfg.base_numeric_dim = int(getattr(dataset, "base_num_dim", dataset.num_dim))
 
-    # 构建模型 (Build model)
+
     model_fold = _build_model_for_mode(model_mode, fp_dim_for_model, dataset.num_dim, cfg)
     device_env = str(os.environ.get("TRANSFORMER_DEVICE", "")).strip()
     trainer = FingerprintTrainer(model_fold, cfg, device=device_env or None)
     use_cuda = str(trainer.device).lower().startswith("cuda")
-    
-    # 采样器 (Balanced Sampler)
+
+
     train_sampler, _ = _build_category_balanced_sampler(dataset, train_subset, train_idx)
     train_loader = DataLoader(
         train_subset,
@@ -4306,19 +4190,19 @@ def _train_stability_model_for_fold(
         pin_memory=use_cuda,
     )
 
-    # 物理先验 (Physics Prior)
+
     physics_meta_np = _build_category_physics_meta(dataset, train_idx)
     physics_prior_t = torch.as_tensor(physics_meta_np["sign"], dtype=torch.float32, device=trainer.device)
     physics_meta_t = _physics_meta_to_tensors(physics_meta_np, trainer.device)
-    
+
     best_state = None
     best_monitor_r2 = float("-inf")
     best_monitor_rmse = float("inf")
     patience = 0
 
-    # 训练循环 (Training Loop)
+
     for _epoch in range(1, int(cfg.max_epochs) + 1):
-        # 训练一个 Epoch (使用因果不变性损失)
+
         _ = _train_epoch_causal_invariant(
             trainer=trainer,
             dataloader=train_loader,
@@ -4327,21 +4211,21 @@ def _train_stability_model_for_fold(
             epoch=int(_epoch),
             max_epochs=int(cfg.max_epochs),
         )
-        
-        # 验证 (Evaluation)
+
+
         _, val_r2_epoch, val_rmse_epoch = trainer.evaluate(hold_loader)
-        
-        # 学习率调度 (Scheduler Step)
+
+
         if cfg.scheduler_type == "plateau" and trainer.scheduler is not None:
             trainer.scheduler.step(val_rmse_epoch if np.isfinite(val_rmse_epoch) else 1.0)
-            
-        # 早停检查 (Early Stopping Check)
+
+
         improved = False
         if np.isfinite(val_r2_epoch):
             improved = val_r2_epoch > best_monitor_r2 + float(cfg.min_delta)
         elif np.isfinite(val_rmse_epoch):
             improved = val_rmse_epoch < best_monitor_rmse - float(cfg.min_delta)
-            
+
         if improved:
             best_monitor_r2 = float(val_r2_epoch)
             best_monitor_rmse = float(val_rmse_epoch)
@@ -4349,7 +4233,7 @@ def _train_stability_model_for_fold(
             patience = 0
         else:
             patience += 1
-            
+
         if patience >= int(cfg.early_stopping_patience):
             break
 
@@ -4379,28 +4263,8 @@ def _compute_consensus_rows_core(
     weight_stab: float = 0.20,
     weight_support: float = 0.10,
 ) -> Tuple[list, np.ndarray, np.ndarray, list]:
-    """
-    计算核心的“共识”特征分数 (Compute Core Consensus Feature Scores).
-    
-    这是 "Explainable AI" 的核心部分，综合多种指标对指纹位进行评分：
-    1. **Attention Weights**: 模型实际上关注了哪些位？
-    2. **Integrated Gradients (IG)**: 哪些位对预测结果贡献最大？
-    3. **Delta Impact**: 移除某些位会导致预测值变化多大？
-    4. **Stability**: 这些特征在多次 Bootstrap 采样中是否稳定出现？
-    5. **Support**: 有多少样本实际上激活了这个位？
-    
-    参数:
-    - model: 训练好的模型
-    - stability_override: 预先计算的稳定性分数 (来自 Cross-Seed Analysis)
-    - weight_*: 各个评分分量的权重
-    
-    返回:
-    - selected_rows: 最终选出的 Top-K 特征详细信息列表
-    - importance_scores: 所有候选特征的综合得分
-    - ...
-    """
-    
-    # 1. 收集注意力矩阵 (Collect Attention Weights)
+
+
     # [N_samples, N_features]
     attn_mat = _collect_attention_sample_matrix_from_arrays(
         model=model,
@@ -4409,8 +4273,8 @@ def _compute_consensus_rows_core(
         feature_labels=feature_labels,
         batch_size=min(64, max(8, int(batch_size))),
     )
-    
-    # 2. 收集积分梯度矩阵 (Collect Integrated Gradients)
+
+
     # [N_samples, N_features]
     ig_mat = _collect_ig_sample_matrix_from_arrays(
         model=model,
@@ -4419,37 +4283,35 @@ def _compute_consensus_rows_core(
         batch_size=min(32, max(4, int(batch_size))),
         steps=int(ig_steps),
     )
-    
-    # 计算特征活跃度 (Feature Activity)
+
+
     active_mat = (np.abs(fingerprint_np) > 1e-6).astype(np.float32)
     support_count = active_mat.sum(axis=0).astype(np.float32)
     support_frac = support_count / max(float(fingerprint_np.shape[0]), 1.0)
     denom = np.where(support_count > 0, support_count, 1.0)
-    
-    # 计算平均分数 (Average Scores per Feature)
+
+
     attn_score = (attn_mat * active_mat).sum(axis=0) / denom
     ig_score = (ig_mat * active_mat).sum(axis=0) / denom
     support_gate = support_count >= float(min_support)
 
-    # 归一化 (Normalize)
+
     attn_norm = _minmax_scale_array(attn_score)
     ig_norm = _minmax_scale_array(ig_score)
     support_norm = _minmax_scale_array(support_frac)
-    
-    # 初步筛选Top-K候选 (Preliminary Screening)
-    # 组合 Attention, IG, Support 分数来选出最有潜力的特征进行后续昂贵的计算
+
+
     pre_score = 0.55 * attn_norm + 0.45 * ig_norm + 0.15 * support_norm
-    # 过滤掉支持度过低的特征
+
     pre_score = np.where(support_gate, pre_score, -np.inf)
-    
+
     candidate_order = np.argsort(pre_score)[::-1]
     candidate_local_idx = [int(i) for i in candidate_order.tolist() if np.isfinite(pre_score[int(i)])][: int(candidate_topk)]
-    
+
     if not candidate_local_idx:
         return [], active_mat, support_count, []
 
-    # 3. 计算掩码扰动分数 (Mask Delta Impact) - 仅针对候选特征
-    # 这是一个昂贵的操作：逐个屏蔽特征并测量预测值的变化
+
     delta_map = _compute_mask_delta_scores_from_arrays(
         model=model,
         fingerprint_np=fingerprint_np,
@@ -4457,9 +4319,8 @@ def _compute_consensus_rows_core(
         candidate_local_idx=candidate_local_idx,
         batch_size=min(64, max(8, int(batch_size))),
     )
-    
-    # 4. 计算稳定性分数 (Stability Analysis via Bootstrapping)
-    # 在样本层面进行 Bootstrap，看特征的重要性在不同样本子集中是否稳定
+
+
     combined_sample = 0.5 * _row_normalize_nonnegative(attn_mat * active_mat) + 0.5 * _row_normalize_nonnegative(ig_mat * active_mat)
     bootstrap_map = _compute_bootstrap_stability_scores(
         sample_score_matrix=combined_sample,
@@ -4473,29 +4334,29 @@ def _compute_consensus_rows_core(
     perturb_score = np.zeros((fingerprint_np.shape[1],), dtype=np.float32)
     stability_score = np.zeros((fingerprint_np.shape[1],), dtype=np.float32)
     bootstrap_score = np.zeros((fingerprint_np.shape[1],), dtype=np.float32)
-    
-    # 处理候选特征的各个分数 (Process Candidate Scores)
+
+
     for pos, local_idx in enumerate(candidate_local_idx):
-        # 获取 Delta Impact
+
         info = delta_map.get(int(local_idx), {})
         cnt = int(info.get("delta_count", 0))
         if cnt > 0:
             perturb_score[int(local_idx)] = float(info.get("delta_sum", 0.0) / max(cnt, 1))
-            
-        # 获取 Bootstrap Stability
+
+
         bootstrap_score[int(local_idx)] = float(bootstrap_map.get(int(local_idx), 0.0))
-        
-        # 确定最终使用的 Stability Score (Override vs Bootstrap vs None)
+
+
         if str(stability_mode).strip().lower() == "override" and isinstance(stability_override, dict):
-            # 如果有 Cross-Seed Stability，优先使用
+
             stability_score[int(local_idx)] = float(stability_override.get(str(feature_labels[int(local_idx)]), 0.0))
         elif str(stability_mode).strip().lower() == "none":
             stability_score[int(local_idx)] = 0.0
         else:
-            # 默认使用本次 Bootstrap 结果
+
             stability_score[int(local_idx)] = float(bootstrap_map.get(int(local_idx), 0.0))
 
-    # 归一化各个分量以便加权 (Normalize Components for Weighted Sum)
+
     attn_cons = _minmax_scale_array(attn_score[candidate_local_idx])
     ig_cons = _minmax_scale_array(ig_score[candidate_local_idx])
     delta_cons = _minmax_scale_array(perturb_score[candidate_local_idx])
@@ -4505,7 +4366,7 @@ def _compute_consensus_rows_core(
     rows = []
     for pos, local_idx in enumerate(candidate_local_idx):
         bit_name = str(feature_labels[int(local_idx)])
-        # 组装特征详情
+
         rows.append(
             {
                 "local_feature_idx": int(local_idx),
@@ -4518,7 +4379,7 @@ def _compute_consensus_rows_core(
                 "bootstrap_stability_score": float(bootstrap_score[int(local_idx)]),
                 "support_count": int(round(float(support_count[int(local_idx)]))),
                 "support_frac": float(support_frac[int(local_idx)]),
-                # 计算最终共识分数 (Final Consensus Score)
+
                 "consensus_score": float(
                     weight_attn * float(attn_cons[pos])
                     + weight_ig * float(ig_cons[pos])
@@ -4528,8 +4389,8 @@ def _compute_consensus_rows_core(
                 ),
             }
         )
-        
-    # 按共识分数排序 (Sort by Consensus Score)
+
+
     rows.sort(
         key=lambda row: (
             float(row.get("consensus_score", float("-inf"))),
@@ -4559,22 +4420,8 @@ def _compute_cross_seed_fold_stability(
     topk_features: int,
     fp_select_method: str,
 ) -> Dict[str, float]:
-    """
-    计算跨随机种子和Fold的稳定性分数 (Cross-Seed Fold Stability Analysis).
-    
-    这是最耗时的步骤，通过多次训练不同种子和不同数据划分的模型，
-    来验证特征是否在各种情况下都能被选为Top-K。
-    
-    流程:
-    1. 解析环境变量 TRANSFORMER_CMA_STABILITY_SEEDS (默认 5 个种子)
-    2. 解析环境变量 TRANSFORMER_CMA_STABILITY_FOLDS (默认 5 折)
-    3. 总共训练 Seeds x Folds (默认 25) 个模型
-    4. 对每个模型，在验证集上计算特征重要性，记录 Top-K 特征
-    5. 统计每个特征被选中的频率作为 Stability Score
-    
-    返回:
-    - stability_map: {feature_name: frequency_score}
-    """
+
+
     enabled = _env_bool("TRANSFORMER_CMA_STABILITY_TRUE", True)
     if not enabled:
         return {}
@@ -4596,18 +4443,16 @@ def _compute_cross_seed_fold_stability(
     topk_features = int(max(1, topk_features))
     fp_select_method = str(fp_select_method).strip().lower() or "rf"
 
-    # 双重循环：遍历不同的随机种子和交叉验证Fold
-    # 这就是导致程序运行看似"卡住"的原因，实际上是在后台训练大量模型
+
     print(f"[V5] Starting Stability Analysis: {len(seeds)} seeds x {fold_count} folds...")
-    
+
     for seed in seeds:
         kf = KFold(n_splits=int(fold_count), shuffle=True, random_state=int(seed))
         for fold_id, (sub_train_pos, sub_hold_pos) in enumerate(kf.split(train_indices)):
             sub_train_idx = np.asarray(train_indices[sub_train_pos], dtype=int)
             sub_hold_idx = np.asarray(train_indices[sub_hold_pos], dtype=int)
-            
-            # 为当前Fold训练一个新模型 (Train new model for this fold)
-            # 使用简化的训练流程 (Reduced epochs/patience)
+
+
             try:
                 model_fold, hold_loader = _train_stability_model_for_fold(
                     dataset=dataset,
@@ -4623,12 +4468,11 @@ def _compute_cross_seed_fold_stability(
             except Exception as e:
                 print(f"[V5] Warning: Stability fold failed (seed={seed}, fold={fold_id}): {e}")
                 continue
-                
+
             if model_fold is None or hold_loader is None:
                 continue
-            
-            # 在验证集上计算特征重要性 (Compute Importance on Validation Set)
-            # 使用与最终解释相同的核心算法 (Attention + IG + Support)
+
+
             try:
                 explain = _collect_explain_arrays(hold_loader, max_samples=None)
                 fp_np = np.asarray(explain.get("fingerprint", np.zeros((0, 0), dtype=np.float32)), dtype=np.float32)
@@ -4637,7 +4481,7 @@ def _compute_cross_seed_fold_stability(
                 if fp_np.ndim != 2 or fp_np.shape[0] == 0 or fp_np.shape[1] == 0 or not feature_labels:
                     continue
 
-                # 计算当前Fold的特征排名
+
                 local_rows, _, _, local_ranked = _compute_consensus_rows_core(
                     model=model_fold,
                     fingerprint_np=fp_np,
@@ -4661,7 +4505,7 @@ def _compute_cross_seed_fold_stability(
                 if not local_rows:
                     continue
                 total_runs += 1
-                # 统计哪些特征进入了Top-K
+
                 top_names = [str(x) for x in local_ranked[: int(final_topk)]]
                 for name in top_names:
                     hit_counter[name] += 1
@@ -4674,7 +4518,7 @@ def _compute_cross_seed_fold_stability(
     if total_runs <= 0:
         return stability_map
     for name, hits in hit_counter.items():
-        # 稳定性分数 = 出现在Top-K的次数 / 总运行次数
+
         stability_map[str(name)] = float(hits / max(total_runs, 1))
     return stability_map
 
@@ -4686,21 +4530,13 @@ def export_consensus_motif_artifacts(
     train_indices: np.ndarray,
     prefix: str,
 ) -> Dict[str, object]:
-    """
-    导出共识基团分析的所有结果 (Export Consensus Motif Artifacts).
-    
-    这是整个解释性分析的入口函数，负责调用各个子模块并生成CSV和图表。
-    流程：
-    1. 收集解释数据 (Collect Data).
-    2. 计算跨种子稳定性 (Compute Cross-Seed Stability).
-    3. 计算最终共识分数 (Compute Final Consensus Scores).
-    4. 导出 CSV 和 绘制图表 (Export & Plot).
-    """
+
+
     out_dir = get_run_output_dir(prefix)
     if explain_loader is None:
         return {}
 
-    # 读取环境变量配置 (Read Config from Env)
+
     max_samples = int(max(64, int(_env_value("TRANSFORMER_CMA_MAX_SAMPLES", None, 512))))
     ig_steps = int(max(4, int(_env_value("TRANSFORMER_CMA_IG_STEPS", None, 8))))
     bootstrap_rounds = int(max(8, int(_env_value("TRANSFORMER_CMA_BOOTSTRAP_ROUNDS", None, 32))))
@@ -4715,16 +4551,15 @@ def export_consensus_motif_artifacts(
     weight_stab = float(_env_value("TRANSFORMER_CMA_W_STABILITY", None, 0.20))
     weight_support = float(_env_value("TRANSFORMER_CMA_W_SUPPORT", None, 0.10))
 
-    # 收集数据 (Collect Explain Arrays)
+
     explain = _collect_explain_arrays(explain_loader, max_samples=max_samples)
     fp_np = np.asarray(explain.get("fingerprint", np.zeros((0, 0), dtype=np.float32)), dtype=np.float32)
     num_np = np.asarray(explain.get("numeric", np.zeros((0, 0), dtype=np.float32)), dtype=np.float32)
     feature_labels = list(explain.get("feature_labels", []) or [])
     if fp_np.ndim != 2 or fp_np.shape[0] == 0 or fp_np.shape[1] == 0 or not feature_labels:
         return {}
-    
-    # 2. 初步计算共识分数 (Preliminary Consensus Scoring)
-    # 使用 Bootstrapping 计算样本内稳定性
+
+
     rows, _, _, _ = _compute_consensus_rows_core(
         model=model,
         fingerprint_np=fp_np,
@@ -4745,16 +4580,15 @@ def export_consensus_motif_artifacts(
         weight_stab=float(weight_stab),
         weight_support=float(weight_support),
     )
-    
+
     if not rows:
         return {}
 
-    # 3. 计算更严格的跨种子Fold稳定性 (Cross-Seed/Fold Stability Analysis)
-    # 这是一个耗时的过程，但对于验证特征的鲁棒性至关重要
+
     topk_features = int(fp_np.shape[1])
     fp_bits = int(getattr(dataset, "max_fp_bits", dataset.fingerprint_dim))
     fp_select_method = str(_env_value("TRANSFORMER_V3_FP_SELECT", "TRANSFORMER_V2_FP_SELECT", "rf")).strip().lower()
-    
+
     true_stability_map = _compute_cross_seed_fold_stability(
         model=model,
         dataset=dataset,
@@ -4768,23 +4602,22 @@ def export_consensus_motif_artifacts(
         topk_features=int(topk_features),
         fp_select_method=str(fp_select_method),
     )
-    
-    # 4. 更新分数与重新排序 (Update Scores & Re-rank)
+
+
     if true_stability_map:
         for row in rows:
-            # 用 Cross-Seed Stability 替换 Bootstrap Stability
+
             row["stability_score"] = float(true_stability_map.get(str(row.get("bit_name", "")), 0.0))
             row["stability_source"] = "seed_fold"
-            
-        # 重新归一化各项分数 (Re-normalize)
-        # 必须确保所有分量都在 [0, 1] 范围内，才能进行加权求和
+
+
         attn_cons = _minmax_scale_array(np.asarray([float(row.get("attention_score", 0.0)) for row in rows], dtype=np.float32))
         ig_cons = _minmax_scale_array(np.asarray([float(row.get("ig_score", 0.0)) for row in rows], dtype=np.float32))
         delta_cons = _minmax_scale_array(np.asarray([float(row.get("perturb_score", 0.0)) for row in rows], dtype=np.float32))
         stab_cons = _minmax_scale_array(np.asarray([float(row.get("stability_score", 0.0)) for row in rows], dtype=np.float32))
         supp_cons = _minmax_scale_array(np.asarray([float(row.get("support_frac", 0.0)) for row in rows], dtype=np.float32))
-        
-        # 重新计算加权共识分数
+
+
         for pos, row in enumerate(rows):
             row["consensus_score"] = float(
                 weight_attn * float(attn_cons[pos])
@@ -4793,8 +4626,8 @@ def export_consensus_motif_artifacts(
                 + weight_stab * float(stab_cons[pos])
                 + weight_support * float(supp_cons[pos])
             )
-            
-        # 重新排序 (Re-sort)
+
+
         rows.sort(
             key=lambda row: (
                 float(row.get("consensus_score", float("-inf"))),
@@ -4807,18 +4640,18 @@ def export_consensus_motif_artifacts(
             reverse=True,
         )
     else:
-        # 如果未进行 Cross-Seed Stability 分析，标记数据源为 Bootstrap
+
         for row in rows:
             row["stability_source"] = "bootstrap"
 
-    # 5. 导出结果 (Export Results)
+
     dataset.fit_scalers(np.asarray(train_indices, dtype=int))
-    # 保存详细的特征评分表
+
     pd.DataFrame(rows).to_csv(os.path.join(out_dir, "consensus_motif_scores.csv"), index=False, encoding="utf-8-sig")
     metric_map = {str(row["bit_name"]): dict(row) for row in rows}
 
     ranked_bit_names = [str(row["bit_name"]) for row in rows]
-    # 导出子结构可视化和详细信息 (Export Substructure Visualizations)
+
     sub_info = export_attention_substructure_artifacts(
         dataset=dataset,
         train_indices=train_indices,
@@ -4830,44 +4663,44 @@ def export_consensus_motif_artifacts(
     selected_rows = list((sub_info or {}).get("selected_rows", []) or [])
     bit_rows = list((sub_info or {}).get("bit_rows", []) or [])
     functional_rows = list((sub_info or {}).get("functional_rows", []) or [])
-    
-    # 6. 生成图表 (Generate Plots)
+
+
     if functional_rows:
-        # 补充功能基团信息
+
         functional_rows = _supplement_functional_group_rows(
             functional_rows,
             output_dir=out_dir,
             top_n=int(_env_value("TRANSFORMER_TOP_FUNCTIONAL_GROUPS", None, 10)),
         )
-        # 保存功能基团评分表
+
         pd.DataFrame(functional_rows).to_csv(os.path.join(out_dir, "consensus_motif_family_scores.csv"), index=False, encoding="utf-8-sig")
-        # 绘制功能基团柱状图
+
         _plot_top_functional_groups(
             functional_rows,
             out_dir,
             artifact_tag="consensus",
             top_n=int(_env_value("TRANSFORMER_TOP_FUNCTIONAL_GROUPS", None, 10)),
         )
-        # 绘制共识 Motif 雷达图
+
         _plot_consensus_top_motifs(
             functional_rows,
             out_dir,
             top_n=int(_env_value("TRANSFORMER_TOP_FUNCTIONAL_GROUPS", None, 10)),
         )
-        # 绘制 Top 功能基团的分子结构图
+
         _plot_top_functional_group_structures(
             output_dir=out_dir,
             top_n=int(_env_value("TRANSFORMER_TOP_FUNCTIONAL_GROUPS", None, 10)),
         )
     elif selected_rows:
-        # 如果没有完整的功能基团分析，进行简单的聚合
+
         family_counter = Counter()
         family_support = Counter()
         for row in selected_rows:
             fg_name = str(row.get("functional_group", "")).strip() or "Unassigned"
             family_counter[fg_name] += float(row.get("consensus_score", 0.0))
             family_support[fg_name] += int(row.get("support_count", 0))
-            
+
         family_rows = [
             {
                 "functional_group": str(name),
@@ -4879,9 +4712,9 @@ def export_consensus_motif_artifacts(
         pd.DataFrame(family_rows).to_csv(os.path.join(out_dir, "consensus_motif_family_scores.csv"), index=False, encoding="utf-8-sig")
         _plot_consensus_top_motifs(selected_rows, out_dir, top_n=final_topk)
     else:
-        # 最基础的 Motif 绘图
+
         _plot_consensus_top_motifs(rows, out_dir, top_n=final_topk)
-        
+
     bit_to_family = {}
     source_rows = bit_rows if bit_rows else selected_rows
     for row in source_rows:
@@ -4889,7 +4722,7 @@ def export_consensus_motif_artifacts(
         family = str(row.get("functional_group", "")).strip()
         if bit_name and family:
             bit_to_family[bit_name] = family
-            
+
     return {
         "ranked_bit_names": ranked_bit_names,
         "selected_rows": selected_rows,
@@ -4898,11 +4731,11 @@ def export_consensus_motif_artifacts(
     }
 
 # =============================================================================
-# Utility helpers (通用工具函数)
+
 
 # =============================================================================
 def _env_bool(name: str, default: bool = False) -> bool:
-    """从环境变量读取布尔值 (Read boolean from env var)."""
+
     v = os.environ.get(name)
     if v is None:
         return bool(default)
@@ -4910,7 +4743,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def _env_value(primary: str, fallback: Optional[str], default):
-    """从环境变量读取值，支持回退机制 (Read value with fallback)."""
+
     v = os.environ.get(primary)
     if (v is None or str(v).strip() == "") and fallback:
         v = os.environ.get(fallback)
@@ -4920,7 +4753,7 @@ def _env_value(primary: str, fallback: Optional[str], default):
 
 
 def _env_bool_pair(primary: str, fallback: Optional[str], default: bool = False) -> bool:
-    """从环境变量对读取布尔值 (Read boolean from env var pair)."""
+
     v = _env_value(primary, fallback, None)
     if v is None:
         return bool(default)
@@ -4928,22 +4761,20 @@ def _env_bool_pair(primary: str, fallback: Optional[str], default: bool = False)
 
 
 def _setdefault_env(name: str, value) -> None:
-    """如果环境变量未设置，则设置默认值 (Set default env var if not set)."""
+
     if os.environ.get(name) is None:
         os.environ[name] = str(value)
 
 
 def _apply_plot_defaults_if_needed() -> None:
-    """
-    设置绘图和分析相关的默认环境变量配置。
-    Keep V3 plot output style aligned with transformer.py.
-    """
+
+
     _setdefault_env("TRANSFORMER_PLOT_FUSION", "0")
     _setdefault_env("TRANSFORMER_PLOT_FEATURE_CORR_NETWORK", "0")
     _setdefault_env("TRANSFORMER_FEATURE_CORR_PAPER", "0")
     _setdefault_env("TRANSFORMER_PLOT_FEATURE_CORR_NETWORK20", "1")
     _setdefault_env("TRANSFORMER_PLOT_ATTN_CLS_BY_CATEGORY", "1")
-    # Attention分析参数
+
     _setdefault_env("TRANSFORMER_ATTN_TOPN", "20")
     _setdefault_env("TRANSFORMER_ATTN_CAT_HEATMAP_TOPN", "20")
     _setdefault_env("TRANSFORMER_ATTN_CAT_HEATMAP_MIN_CATEGORY", "8")
@@ -4959,7 +4790,7 @@ def _apply_plot_defaults_if_needed() -> None:
     _setdefault_env("TRANSFORMER_ATTN_SUBSTRUCT_MIN_ATOMS", "2")
     _setdefault_env("TRANSFORMER_ATTN_SUBSTRUCT_UNIQUE_TOPK", "10")
     _setdefault_env("TRANSFORMER_ATTN_SUBSTRUCT_UNIQUE_MIN_HEAVY", "4")
-    # CMA (Consensus Motif Analysis) 参数
+
     _setdefault_env("TRANSFORMER_CMA_ENABLE", "1")
     _setdefault_env("TRANSFORMER_CMA_TOPK", "10")
     _setdefault_env("TRANSFORMER_CMA_CANDIDATE_TOPK", "24")
@@ -4969,7 +4800,7 @@ def _apply_plot_defaults_if_needed() -> None:
     _setdefault_env("TRANSFORMER_CMA_IG_STEPS", "8")
     _setdefault_env("TRANSFORMER_CMA_BOOTSTRAP_ROUNDS", "32")
     _setdefault_env("TRANSFORMER_CMA_BOOTSTRAP_FRAC", "0.75")
-    # CMA 稳定性分析参数
+
     _setdefault_env("TRANSFORMER_CMA_STABILITY_TRUE", "1")
     _setdefault_env("TRANSFORMER_CMA_STABILITY_SEEDS", "11,19,23,29,37")
     _setdefault_env("TRANSFORMER_CMA_STABILITY_FOLDS", "5")
@@ -4977,7 +4808,7 @@ def _apply_plot_defaults_if_needed() -> None:
     _setdefault_env("TRANSFORMER_CMA_STABILITY_EARLY_STOP", "20")
     _setdefault_env("TRANSFORMER_CMA_STABILITY_BATCH_SIZE", "32")
     _setdefault_env("TRANSFORMER_CMA_STABILITY_MIN_DELTA", "1e-4")
-    # CMA 评分权重
+
     _setdefault_env("TRANSFORMER_CMA_W_ATTENTION", "0.20")
     _setdefault_env("TRANSFORMER_CMA_W_IG", "0.20")
     _setdefault_env("TRANSFORMER_CMA_W_DELTA", "0.30")
@@ -4990,9 +4821,9 @@ def _apply_plot_defaults_if_needed() -> None:
 
 
 def _init_run_output_dir() -> str:
-    """创建运行输出目录，按时间戳命名 (Create run output dir)."""
+
     global RUN_OUTPUT_DIR
-    run_name = datetime.now().strftime("运行_%Y%m%d_%H%M%S")
+    run_name = datetime.now().strftime("run_%Y%m%d_%H%M%S")
     run_dir = os.path.join(OUT_DIR, run_name)
     if os.path.exists(run_dir):
         suffix = 1
@@ -5008,7 +4839,7 @@ def _init_run_output_dir() -> str:
 
 
 def _to_prefix_model_name(model_mode: str) -> str:
-    """标准化模型名称前缀 (Normalize model name prefix)."""
+
     m = str(model_mode).strip().lower()
     if m == "attn":
         return "Attn"
@@ -5018,7 +4849,7 @@ def _to_prefix_model_name(model_mode: str) -> str:
 
 
 def _get_objective_target() -> str:
-    """获取优化目标 (val/test)."""
+
     t = str(
         _env_value(
             "TRANSFORMER_V7_OBJECTIVE_TARGET",
@@ -5032,7 +4863,7 @@ def _get_objective_target() -> str:
 
 
 def _reset_best_result_state(objective_target: str = "val") -> None:
-    """重置全局最佳结果记录 (Reset best result state)."""
+
     BEST_RESULT.clear()
     BEST_RESULT.update(
         {
@@ -5060,7 +4891,7 @@ def _safe_float(x: float) -> float:
 
 
 def _metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[float, float]:
-    """计算 R2 和 RMSE 指标 (Compute metrics)."""
+
     y_true = np.asarray(y_true, dtype=float).reshape(-1)
     y_pred = np.asarray(y_pred, dtype=float).reshape(-1)
     mask = np.isfinite(y_true) & np.isfinite(y_pred)
@@ -5072,7 +4903,7 @@ def _metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[float, float]:
 
 
 def _extract_subset_base_indices(subset, fallback_indices: np.ndarray) -> np.ndarray:
-    """提取 Subset 的原始索引 (Extract original indices from Subset)."""
+
     if isinstance(subset, SelectedFeatureSubset):
         return np.asarray(subset.indices, dtype=int)
     if isinstance(subset, Subset) and hasattr(subset, "indices"):
@@ -5085,10 +4916,8 @@ def _build_category_balanced_sampler(
     train_subset,
     train_idx: np.ndarray,
 ) -> Tuple[Optional[WeightedRandomSampler], Optional[Dict[str, object]]]:
-    """
-    构建类别平衡采样器 (Category-Balanced Sampler).
-    解决数据中类别不平衡的问题，通过赋予稀有类别更高的采样权重。
-    """
+
+
     enabled = _env_bool_pair("TRANSFORMER_V5_BALANCED_SAMPLER", "TRANSFORMER_V3_BALANCED_SAMPLER", False)
     if not enabled:
         return None, None
@@ -5106,7 +4935,7 @@ def _build_category_balanced_sampler(
     if uniq.size < 2:
         return None, None
 
-    # 计算类别权重: weight = 1 / sqrt(count)
+
     weight_by_cat = {}
     for c, n in zip(uniq.tolist(), cnt.tolist()):
         weight_by_cat[int(c)] = float(1.0 / max(np.sqrt(float(n)), 1.0))
@@ -5114,9 +4943,9 @@ def _build_category_balanced_sampler(
     mean_w = float(np.mean(sample_w)) if sample_w.size > 0 else 1.0
     if mean_w > 0:
         sample_w = sample_w / mean_w
-    # 限制权重范围，防止过度采样
+
     sample_w = np.clip(sample_w, 0.1, 8.0)
-    
+
     sampler = WeightedRandomSampler(
         weights=torch.as_tensor(sample_w, dtype=torch.double),
         num_samples=int(sample_w.shape[0]),
@@ -5150,7 +4979,7 @@ def _build_category_balanced_sampler(
 
 
 def _resolve_chem_attention_model(model: nn.Module) -> Optional["ChemistryAwareAttentionTransformer"]:
-    """从模型中解析出 ChemistryAwareAttentionTransformer 实例。"""
+
     if isinstance(model, ChemistryAwareAttentionTransformer):
         return model
     attn_expert = getattr(model, "attn_expert", None)
@@ -5159,7 +4988,7 @@ def _resolve_chem_attention_model(model: nn.Module) -> Optional["ChemistryAwareA
     return None
 
 def _save_v3_sampler_plot(output_dir: str, sampler_info: Optional[Dict[str, object]]) -> None:
-    """绘制采样器权重分布图 (Plot sampler weight distribution)."""
+
     if not output_dir or not isinstance(sampler_info, dict):
         return
     stats = list(sampler_info.get("stats", []) or [])
@@ -5187,7 +5016,7 @@ def _save_v3_sampler_plot(output_dir: str, sampler_info: Optional[Dict[str, obje
 
 
 def _save_v3_fusion_plot(output_dir: str, fusion_result: Optional[Dict[str, object]]) -> None:
-    """绘制融合权重图 (Plot fusion weights)."""
+
     if not output_dir or not isinstance(fusion_result, dict):
         return
     try:
@@ -5229,7 +5058,7 @@ def _save_v3_chem_attention_bias_plot(
     max_batches: int = 12,
     max_tokens: int = 40,
 ) -> None:
-    """绘制化学感知注意力偏置图 (Plot Chemistry-Aware Attention Bias Heatmap)."""
+
     if not output_dir:
         return
     attn_model = _resolve_chem_attention_model(model)
@@ -5297,25 +5126,25 @@ def _save_v3_innovation_artifacts(
     sampler_info: Optional[Dict[str, object]],
     fusion_result: Optional[Dict[str, object]],
 ) -> None:
-    """保存 V3/V5 创新特性的相关图表和工件 (Save innovation artifacts)."""
+
     if not output_dir:
         return
     try:
-        # 保存采样器分布图
+
         if sampler_info:
             _save_v3_sampler_plot(output_dir, sampler_info)
-        # 保存融合权重图
+
         if fusion_result:
             _save_v3_fusion_plot(output_dir, fusion_result)
-        # 保存化学注意力偏置热图
+
         _save_v3_chem_attention_bias_plot(output_dir, model, test_loader)
-        
-        # 保存训练历史数据
+
+
         if epoch_history:
             hist_csv = os.path.join(output_dir, "training_history.csv")
             pd.DataFrame(epoch_history).to_csv(hist_csv, index=False)
-            
-            # 绘制训练曲线
+
+
             try:
                 df = pd.DataFrame(epoch_history)
                 plt.figure(figsize=(10, 6))
@@ -5337,7 +5166,7 @@ def _save_v3_innovation_artifacts(
 
 
 def _get_base_dataset(ds):
-    """获取基础数据集对象 (Get base dataset)."""
+
     if isinstance(ds, SelectedFeatureSubset):
         return ds.base
     if isinstance(ds, Subset) and hasattr(ds, "dataset"):
@@ -5351,10 +5180,8 @@ def _predict_raw(
     device: str,
     return_indices: bool = False,
 ) -> Tuple[np.ndarray, ...]:
-    """
-    基础预测函数 (Basic prediction loop).
-    返回: (y_true, y_pred) 或 (y_true, y_pred, indices)
-    """
+
+
     model.eval()
     base_ds = _get_base_dataset(dataloader.dataset)
 
@@ -5369,9 +5196,9 @@ def _predict_raw(
             numeric = batch["numeric"].to(device, non_blocking=non_blocking)
             y_raw = batch["logk_raw"].detach().cpu().numpy().reshape(-1)
 
-            # 模型前向传播
+
             preds_scaled = model(fp, numeric)
-            # 反归一化预测值
+
             preds_scaled_np = preds_scaled.detach().to(torch.float32).cpu().numpy().reshape(-1, 1)
             preds_raw = base_ds.logk_scaler.inverse_transform(preds_scaled_np).reshape(-1)
 
@@ -5396,14 +5223,14 @@ def _predict_raw(
     y_true = np.concatenate(y_true_list).astype(np.float32)
     y_pred = np.concatenate(y_pred_list).astype(np.float32)
     idx = np.concatenate(idx_list).astype(int, copy=False)
-    
-    # 移除无效值
+
+
     mask = np.isfinite(y_true) & np.isfinite(y_pred)
     y_true = y_true[mask]
     y_pred = y_pred[mask]
     idx = idx[mask]
 
-    # 按索引排序以确保一致性
+
     if idx.size > 0 and np.all(idx >= 0):
         order = np.argsort(idx, kind="stable")
         y_true = y_true[order]
@@ -5422,7 +5249,7 @@ def _predict_split_triplet(
     val_loader: DataLoader,
     test_loader: DataLoader,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """一次性预测 Train/Val/Test 三个数据集 (Predict all splits)."""
+
     y_train, pred_train, idx_train = _predict_raw(model, train_eval_loader, device, return_indices=True)
     y_val, pred_val, idx_val = _predict_raw(model, val_loader, device, return_indices=True)
     y_test, pred_test, idx_test = _predict_raw(model, test_loader, device, return_indices=True)
@@ -5430,14 +5257,14 @@ def _predict_split_triplet(
 
 
 def _softmax_weights(scores: list, temperature: float = 0.02) -> np.ndarray:
-    """Softmax 加权函数 (Softmax weighting)."""
+
     arr = np.asarray(scores, dtype=float).reshape(-1)
     if arr.size == 0:
         return arr
     if not np.all(np.isfinite(arr)):
         return np.ones(arr.shape[0], dtype=float) / float(arr.shape[0])
     t = float(max(1e-4, temperature))
-    # 减去最大值以防止溢出
+
     z = (arr - float(np.max(arr))) / t
     z = np.clip(z, -60.0, 60.0)
     w = np.exp(z)
@@ -5451,7 +5278,7 @@ def _build_category_physics_meta(
     dataset: FingerprintReactionDataset,
     train_idx: np.ndarray,
 ) -> Dict[str, np.ndarray]:
-    """V6 经验 pH 先验元数据：方向、置信度、有效 pH 范围与统计量。"""
+
     cat_mat = np.asarray(dataset.category, dtype=np.float32)
     if cat_mat.ndim != 2 or cat_mat.shape[1] <= 0:
         zeros = np.zeros((1,), dtype=np.float32)
@@ -5473,7 +5300,7 @@ def _build_category_physics_meta(
     y_raw = np.asarray(dataset.logk_raw, dtype=float).reshape(-1)
     idx = np.asarray(train_idx, dtype=int).reshape(-1)
     idx = idx[(idx >= 0) & (idx < cat_idx_all.shape[0])]
-    
+
     min_samples = int(_env_value("TRANSFORMER_V4_PHYSICS_MIN_SAMPLES", "TRANSFORMER_V3_PHYSICS_MIN_SAMPLES", "18"))
     corr_thr = float(_env_value("TRANSFORMER_V4_PHYSICS_CORR_THR", "TRANSFORMER_V3_PHYSICS_CORR_THR", "0.12"))
     slope_thr = float(_env_value("TRANSFORMER_V4_PHYSICS_SLOPE_THR", "TRANSFORMER_V3_PHYSICS_SLOPE_THR", "0.015"))
@@ -5485,7 +5312,7 @@ def _build_category_physics_meta(
     fg_state_prior = _env_bool_pair("TRANSFORMER_V7_PHYSICS_FG_STATE", "TRANSFORMER_V6_PHYSICS_FG_STATE", False)
     fg_state_width = float(_env_value("TRANSFORMER_V7_PHYSICS_FG_WIDTH", "TRANSFORMER_V6_PHYSICS_FG_WIDTH", "1.35"))
     fg_state_conf = float(_env_value("TRANSFORMER_V7_PHYSICS_FG_CONF", "TRANSFORMER_V6_PHYSICS_FG_CONF", "0.38"))
-    
+
     sign_prior = np.zeros((n_cat,), dtype=np.float32)
     target_slope_prior = np.zeros((n_cat,), dtype=np.float32)
     conf_prior = np.zeros((n_cat,), dtype=np.float32)
@@ -5740,22 +5567,22 @@ def _build_category_physics_meta(
                 lo_scaled, hi_scaled = -1.0, 1.0
             sample_ph_lo[row_idx] = min(lo_scaled, hi_scaled)
             sample_ph_hi[row_idx] = max(max(lo_scaled, hi_scaled), min(lo_scaled, hi_scaled) + 1e-3)
-        
+
     for c in range(n_cat):
         c_idx = idx[cat_idx_all[idx] == c]
         if c_idx.size < min_samples:
             continue
         x = ph_raw[c_idx].astype(float)
         y = y_raw[c_idx].astype(float)
-        
-        # 简单线性回归估计斜率
+
+
         x0 = x - float(np.mean(x))
         y0 = y - float(np.mean(y))
         var_x = float(np.sum(x0 * x0))
         if var_x <= 1e-10:
             continue
         slope = float(np.sum(x0 * y0) / (var_x + 1e-12))
-        
+
         try:
             corr = float(np.corrcoef(x, y)[0, 1])
         except Exception:
@@ -5813,7 +5640,7 @@ def _build_category_physics_meta(
                     valid_prior[c] = 1.0
                     continue
 
-        # 只有当相关性和斜率都足够显著时才认为存在先验
+
         if (
             np.isfinite(slope)
             and np.isfinite(corr)
@@ -5851,12 +5678,12 @@ def _build_category_physics_prior(
     dataset: FingerprintReactionDataset,
     train_idx: np.ndarray,
 ) -> np.ndarray:
-    """兼容旧接口，仅返回方向先验。"""
+
     return _build_category_physics_meta(dataset, train_idx)["sign"]
 
 
 def _physics_meta_to_tensors(meta: Optional[Dict[str, np.ndarray]], device: str) -> Dict[str, torch.Tensor]:
-    """将经验先验元数据转换为训练时使用的张量。"""
+
     if not isinstance(meta, dict):
         return {}
     out: Dict[str, torch.Tensor] = {}
@@ -5871,7 +5698,7 @@ def _group_mse_losses(
     target: torch.Tensor,
     category_onehot: torch.Tensor,
 ) -> torch.Tensor:
-    """计算每个类别的平均 MSE 损失，用于 DRO (Distributionally Robust Optimization)。"""
+
     cat_idx = torch.argmax(category_onehot, dim=1)
     uniq = torch.unique(cat_idx)
     losses = []
@@ -6411,10 +6238,7 @@ def _get_fp_ranking(
 # Model innovation: chemistry-aware transformer + uncertainty-aware dual experts
 # =============================================================================
 class ChemistryAwareTransformerEncoderLayer(nn.Module):
-    """
-    带有可选的加性化学感知注意力偏置的Transformer编码器层。
-    这是标准Transformer层的修改版，允许在注意力计算中注入特定于化学的偏置（Bias）。
-    """
+
 
     def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1, norm_first: bool = False):
         super().__init__()
@@ -6430,7 +6254,7 @@ class ChemistryAwareTransformerEncoderLayer(nn.Module):
         self.norm_first = bool(norm_first)
 
     def _expand_attn_mask(self, attn_mask: Optional[torch.Tensor], batch_size: int) -> Optional[torch.Tensor]:
-        """扩展注意力掩码以匹配(Batch * Num_Heads, Seq_Len, Seq_Len)的形状。"""
+
         if attn_mask is None:
             return None
         if attn_mask.dim() == 2:
@@ -6485,24 +6309,22 @@ class ChemistryAwareTransformerEncoderLayer(nn.Module):
 
 
 def _save_v3_sampler_plot(output_dir: str, info: Dict[str, object]):
-    """
-    绘制采样器分布图 (Visualize sampler distribution).
-    显示不同类别在不同 Epoch 的采样概率变化。
-    """
+
+
     try:
         import matplotlib.pyplot as plt
         history = info.get("history", [])
         if not history:
             return
-        
+
         epochs = [h["epoch"] for h in history]
         probs = np.array([h["probs"] for h in history])
         n_cat = probs.shape[1]
-        
+
         plt.figure(figsize=(10, 6))
         for i in range(n_cat):
             plt.plot(epochs, probs[:, i], label=f"Cat {i}")
-            
+
         plt.xlabel("Epoch")
         plt.ylabel("Sampling Probability")
         plt.title("Category Sampling Probability Evolution")
@@ -6515,15 +6337,13 @@ def _save_v3_sampler_plot(output_dir: str, info: Dict[str, object]):
 
 
 def _save_v3_fusion_plot(output_dir: str, result: Dict[str, object]):
-    """
-    绘制融合权重图 (Visualize fusion weights).
-    显示不同基础模型在最终融合中的权重贡献。
-    """
+
+
     try:
         import matplotlib.pyplot as plt
         global_w = result.get("global_weights", [])
         models = list(result.get("component_names", [])) or ["NN", "HGB", "RF", "ET"]
-        
+
         if len(global_w) == len(models):
             plt.figure(figsize=(8, 6))
             plt.bar(models, global_w)
@@ -6533,28 +6353,25 @@ def _save_v3_fusion_plot(output_dir: str, result: Dict[str, object]):
                 plt.text(i, v + 0.01, f"{v:.3f}", ha='center')
             _savefig_with_pdf(plt, os.path.join(output_dir, "fusion_weights.png"))
             plt.close()
-            
+
     except Exception:
         pass
 
 
 def _save_v3_chem_attention_bias_plot(output_dir: str, model: nn.Module, loader: DataLoader):
-    """
-    绘制化学注意力偏置热图 (Visualize Chemistry-Aware Attention Bias).
-    如果模型使用了 chemistry_aware_attention，则提取其可学习的偏置矩阵并可视化。
-    这有助于理解模型学到的化学规则（如不同类别间的相互作用倾向）。
-    """
+
+
     try:
         import matplotlib.pyplot as plt
         import seaborn as sns
-        
-        # 检查模型是否包含 chemistry_aware_bias
+
+
         if hasattr(model, "encoder") and hasattr(model.encoder, "layers"):
-            # 取第一层的注意力模块
+
             attn = model.encoder.layers[0].self_attn
             if hasattr(attn, "chemistry_aware_bias") and attn.chemistry_aware_bias is not None:
                 bias = attn.chemistry_aware_bias.detach().cpu().numpy()
-                
+
                 plt.figure(figsize=(10, 8))
                 sns.heatmap(bias, cmap="RdBu_r", center=0, annot=True, fmt=".2f")
                 plt.title("Chemistry-Aware Attention Bias (Layer 0)")
@@ -6562,13 +6379,13 @@ def _save_v3_chem_attention_bias_plot(output_dir: str, model: nn.Module, loader:
                 plt.ylabel("Query Category")
                 _savefig_with_pdf(plt, os.path.join(output_dir, "chem_attn_bias.png"))
                 plt.close()
-                
+
     except Exception:
         pass
 
 
 def _savefig_with_pdf(plt_obj, path_png, **kwargs):
-    """同时保存 PNG 和 PDF 格式的图片 (Save figure as PNG and PDF)."""
+
     try:
         save_kwargs = {"dpi": 300, "bbox_inches": "tight"}
         save_kwargs.update(kwargs)
@@ -6581,49 +6398,37 @@ def _savefig_with_pdf(plt_obj, path_png, **kwargs):
         pass
 
 
-
 class ChemistryAwareAttentionTransformer(AttentionFingerprintTransformer):
-    """
-    化学感知注意力Transformer (V3+)。
-    在指纹token的交互中引入成对偏置（Pairwise Bias），
-    或者在分类token和指纹token之间引入类别先验。
-    
-    (Note: This class inherits from AttentionFingerprintTransformer for compatibility, 
-     but overrides the core forward logic to inject chemistry awareness.)
-    """
+
+
     def __init__(self, *args, chemistry_aware_attention: bool = True, n_categories: int = 0, **kwargs):
         super().__init__(*args, **kwargs)
         self.chemistry_aware_attention = chemistry_aware_attention
         self.n_categories = n_categories
-        
-        # 覆盖编码器层，使用支持化学偏置的层 (Override with custom encoder layer)
-        # 注意：这里我们重建了 encoder，使用我们自定义的 Layer 类
+
+
         encoder_layer = ChemistryAwareTransformerEncoderLayer(
             self.d_model, self.n_heads, self.dropout_rate, norm_first=True
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=self.n_layers)
-        
-        # 类别偏置矩阵 (Category-Category Interaction Bias)
+
+
         if self.chemistry_aware_attention and n_categories > 1:
-            # 这是一个可学习的矩阵，表示不同类别之间的"亲和力"或"排斥力"
-            # 实际上，它应该作为 Attention Mask 的一部分注入
-            # 但由于 PyTorch nn.MultiheadAttention 的限制，我们通常将其加到 value 或 output 上
-            # 或者，更简单地，我们在 encoder layer 中处理
-            # 这里我们定义参数，将在 forward 中使用
+
+
             self.chem_bias_param = nn.Parameter(torch.zeros(n_categories, n_categories))
             nn.init.xavier_uniform_(self.chem_bias_param)
         else:
             self.chem_bias_param = None
-            
-        # 重新初始化双专家头 (Re-initialize Dual Experts if not present in base)
-        # Expert A: 宽而浅 (Wide & Shallow)
+
+
         self.expert_a = nn.Sequential(
             nn.Linear(self.d_model, self.d_model),
             nn.GELU(),
             nn.Dropout(self.dropout_rate),
             nn.Linear(self.d_model, 1)
         )
-        # Expert B: 深而窄 (Deep & Narrow)
+
         self.expert_b = nn.Sequential(
             nn.Linear(self.d_model, self.d_model),
             nn.GELU(),
@@ -6632,16 +6437,13 @@ class ChemistryAwareAttentionTransformer(AttentionFingerprintTransformer):
             nn.Dropout(self.dropout_rate),
             nn.Linear(self.d_model // 2, 1)
         )
-        # 不确定性门控 (Uncertainty Gating)
+
         self.uncertainty_gate = nn.Linear(self.d_model, 2)
 
 
     def forward(self, fingerprint: torch.Tensor, numeric: torch.Tensor, category: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        前向传播 (Forward Pass).
-        支持注入 category 信息用于化学感知注意力。
-        """
-        # 1. 基础嵌入 (Basic Embedding)
+
+
         B, L, _ = fingerprint.shape
         device = fingerprint.device
 
@@ -6651,15 +6453,15 @@ class ChemistryAwareAttentionTransformer(AttentionFingerprintTransformer):
         if self.training and self.fp_bit_dropout > 0:
             mask = torch.rand_like(fp_val) > self.fp_bit_dropout
             fp_val = fp_val * mask
-            
+
         padding_mask = (fp_idx < 0)
         clean_idx = fp_idx.clone()
         clean_idx[padding_mask] = 0
-        
+
         x_fp = self.idx_emb(clean_idx) + self.val_emb(fp_val) # [B, L, D]
         x_num = self.num_emb(numeric).unsqueeze(1) # [B, 1, D]
-        
-        # 2. 拼接与掩码 (Concatenation & Masking)
+
+
         if self.pooling == "cls":
             cls = self.cls_token.expand(B, -1, -1)
             x = torch.cat([cls, x_num, x_fp], dim=1)
@@ -6674,24 +6476,19 @@ class ChemistryAwareAttentionTransformer(AttentionFingerprintTransformer):
                 padding_mask
             ], dim=1)
 
-        # 3. 注入化学偏置 (Inject Chemistry Bias)
-        # 这是一个简化实现：我们将 bias 注册到 encoder layers 中
-        # 注意：这假设 encoder layers 是 ChemistryAwareTransformerEncoderLayer 实例
+
         if self.chem_bias_param is not None and category is not None:
-            # 这里的逻辑比较复杂：
-            # 我们需要根据 batch 中每个样本的 category，从 chem_bias_param 中选取对应的 bias
-            # 但 Transformer 的 self-attention 是 token-to-token 的
-            # 这里的 bias 实际上是 "Context Bias"
-            # 为简单起见，我们将 global bias 注入到所有层
+
+
             for layer in self.encoder.layers:
                 if hasattr(layer.self_attn, "chemistry_aware_bias"):
-                    # 暂时不动态传递 per-sample bias，而是传递全局 bias 矩阵用于可视化或调试
+
                     layer.self_attn.chemistry_aware_bias = self.chem_bias_param
 
-        # 4. 编码 (Encoding)
+
         x = self.encoder(x, src_key_padding_mask=full_padding_mask)
 
-        # 5. 池化 (Pooling)
+
         if self.pooling == "attn":
             q = self.pool_query.expand(B, -1, -1)
             pool_out, _ = self.pool_attn(q, x, x, key_padding_mask=full_padding_mask)
@@ -6704,23 +6501,20 @@ class ChemistryAwareAttentionTransformer(AttentionFingerprintTransformer):
             len_x = torch.sum(mask, dim=1).clamp(min=1e-9)
             feature = sum_x / len_x
 
-        # 6. 双专家预测 (Dual Expert Prediction)
+
         out_a = self.expert_a(feature)
         out_b = self.expert_b(feature)
-        
-        # 7. 不确定性加权 (Uncertainty Weighting)
+
+
         gate_logits = self.uncertainty_gate(feature)
         weights = F.softmax(gate_logits, dim=1) # [B, 2]
-        
+
         final_pred = weights[:, 0:1] * out_a + weights[:, 1:2] * out_b
         return final_pred
 
 
 class ChemBiasAttentionRegressor(nn.Module):
-    """
-    面向稀疏指纹位的化学偏置注意力回归器。
-    使用 raw fingerprint tokens，并在 pooling 后与 pH/category 数值特征门控融合。
-    """
+
 
     def __init__(self, fingerprint_dim: int, numeric_dim: int, config: Optional[FingerprintConfig] = None):
         super().__init__()
@@ -6961,11 +6755,7 @@ def _build_attention_expert(
 
 
 class DualExpertRegressor(nn.Module):
-    """
-    双专家回归模型。
-    结合了注意力专家（Attention Expert）和MLP专家（MLP Expert）的预测。
-    使用一个门控网络（Gate Net）来动态决定每个样本应该更信任哪个专家的预测。
-    """
+
 
     def __init__(self, fingerprint_dim: int, numeric_dim: int, config: FingerprintConfig):
         super().__init__()
@@ -7239,10 +7029,8 @@ def _adaptive_fusion(
     optimize_target: str = "val",
     groups_train: Optional[np.ndarray] = None,
 ) -> Optional[Dict[str, object]]:
-    """
-    自适应融合 (Adaptive Fusion)。
-    构建并融合多种异构模型（NN, GBDT, RF, ExtraTrees），以利用不同模型的优势。
-    """
+
+
     if x_train.shape[0] < 60 or x_train.shape[1] < 2:
         return None
 
@@ -7298,13 +7086,22 @@ def _adaptive_fusion(
         repeats: int,
         seed_base: int,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """使用不同随机种子训练多个模型并取平均，减少方差。"""
+
         pred_tr_list = []
         pred_va_list = []
         pred_te_list = []
         for i in range(max(1, int(repeats))):
             m = model_builder(int(seed_base + 97 * i))
             m.fit(x_tr, y_tr)
+            residual_export = os.environ.get("DECAT_EXPORT_RESIDUAL_RF", "").strip()
+            if residual_export and isinstance(m, RandomForestRegressor) and int(getattr(m, "n_estimators", 0)) == 280:
+                import pickle
+                os.makedirs(residual_export, exist_ok=True)
+                filename = f"residual_rf_seed{int(seed_base + 97 * i)}.pkl"
+                with open(os.path.join(residual_export, filename), "wb") as handle:
+                    pickle.dump(m, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                with open(os.path.join(residual_export, "residual_rf_manifest.json"), "w", encoding="utf-8") as handle:
+                    json.dump({"files": [filename], "seed_base": int(seed_base), "repeats": int(repeats)}, handle, ensure_ascii=False, indent=2)
             pred_tr_list.append(np.asarray(m.predict(x_tr), dtype=np.float32).reshape(-1))
             pred_va_list.append(np.asarray(m.predict(x_va), dtype=np.float32).reshape(-1))
             pred_te_list.append(np.asarray(m.predict(x_te), dtype=np.float32).reshape(-1))
@@ -7314,7 +7111,7 @@ def _adaptive_fusion(
         return pred_tr, pred_va, pred_te
 
     try:
-        # 1. HistGradientBoostingRegressor (类似LightGBM)
+
         hgb_direct = HistGradientBoostingRegressor(
             loss="squared_error",
             learning_rate=0.05,
@@ -7346,7 +7143,7 @@ def _adaptive_fusion(
             seed_base=int(random_state + 17),
         )
 
-        # 3. ExtraTreesRegressor (可选)
+
         pred_train_etr = pred_val_etr = pred_test_etr = None
         if enable_etr:
             pred_train_etr, pred_val_etr, pred_test_etr = _avg_predict_with_seed_ensemble(
@@ -7365,7 +7162,7 @@ def _adaptive_fusion(
                 seed_base=int(random_state + 23),
             )
 
-        # 4. 残差学习 (Residual Learning): 使用HGB拟合NN的残差
+
         residual_target = y_train - pred_train_nn
         x_train_aug = np.concatenate([x_train, pred_train_nn.reshape(-1, 1)], axis=1)
         x_val_aug = np.concatenate([x_val, pred_val_nn.reshape(-1, 1)], axis=1)
@@ -7384,7 +7181,7 @@ def _adaptive_fusion(
         pred_val_nn_res_hgb = pred_val_nn + hgb_res.predict(x_val_aug)
         pred_test_nn_res_hgb = pred_test_nn + hgb_res.predict(x_test_aug)
 
-        # 5. 残差学习: 使用RF拟合NN的残差 (可选)
+
         pred_train_nn_res_rf = pred_val_nn_res_rf = pred_test_nn_res_rf = None
         if enable_rf_res:
             residual_rf_n_estimators = max(
@@ -7469,7 +7266,7 @@ def _adaptive_fusion(
             pred_test_nn_res_rf,
         )
 
-    # 堆叠泛化 (Stacking Generalization) - 可选高级特性
+
     if enable_stack_components and len(component_names) >= 3:
         meta_train = np.vstack(train_candidates).T.astype(np.float32)
         meta_val = np.vstack(val_candidates).T.astype(np.float32)
@@ -7507,7 +7304,7 @@ def _adaptive_fusion(
                 )
                 model.fit(x_fit, y_fit)
                 return np.asarray(model.predict(x_hold), dtype=np.float32).reshape(-1)
-            
+
             if comp_name == "rf":
                 # Random Forest (averaged over repetitions)
                 pred_list = []
@@ -7522,7 +7319,7 @@ def _adaptive_fusion(
                     model.fit(x_fit, y_fit)
                     pred_list.append(np.asarray(model.predict(x_hold), dtype=np.float32).reshape(-1))
                 return np.mean(np.vstack(pred_list), axis=0).astype(np.float32)
-            
+
             if comp_name == "etr":
                 # Extra Trees
                 pred_list = []
@@ -7537,7 +7334,7 @@ def _adaptive_fusion(
                     model.fit(x_fit, y_fit)
                     pred_list.append(np.asarray(model.predict(x_hold), dtype=np.float32).reshape(-1))
                 return np.mean(np.vstack(pred_list), axis=0).astype(np.float32)
-            
+
             if comp_name == "nn_plus_res_hgb":
                 # NN + Residual (HGB)
                 residual_fit = np.asarray(y_fit, dtype=np.float32).reshape(-1) - np.asarray(nn_fit_pred, dtype=np.float32).reshape(-1)
@@ -7554,7 +7351,7 @@ def _adaptive_fusion(
                 )
                 model.fit(x_fit_aug, residual_fit)
                 return (np.asarray(nn_hold_pred, dtype=np.float32).reshape(-1) + np.asarray(model.predict(x_hold_aug), dtype=np.float32).reshape(-1))
-            
+
             if comp_name == "nn_plus_res_rf":
                 # NN + Residual (RF)
                 residual_fit = np.asarray(y_fit, dtype=np.float32).reshape(-1) - np.asarray(nn_fit_pred, dtype=np.float32).reshape(-1)
@@ -7572,7 +7369,7 @@ def _adaptive_fusion(
                     model.fit(x_fit_aug, residual_fit)
                     pred_list.append(np.asarray(model.predict(x_hold_aug), dtype=np.float32).reshape(-1))
                 return np.asarray(nn_hold_pred, dtype=np.float32).reshape(-1) + np.mean(np.vstack(pred_list), axis=0).astype(np.float32)
-            
+
             if comp_name == "nn":
                 return np.asarray(nn_hold_pred, dtype=np.float32).reshape(-1)
             return None
@@ -7926,25 +7723,8 @@ def objective(
     dro_tau: float,
     generalization_penalty: float,
 ) -> float:
-    """
-    贝叶斯优化目标函数 (Objective Function for Bayesian Optimization).
-    
-    参数 (Parameters):
-    - fp_bits: 分子指纹总位数 (e.g. 2048, 4096)
-    - topk_features: 筛选后的特征数量
-    - d_model: Transformer隐藏层维度
-    - batch_size: 批次大小
-    - lr: 学习率
-    - weight_decay: 权重衰减
-    - dropout: Dropout比率
-    - max_fp_tokens: 最大Fingerprint Token数量 (TopK中的前K个)
-    - n_layers: Transformer层数
-    - n_heads: 多头注意力头数
-    - model_mode: 模型模式 ("attn", "dual", "mlp")
-    
-    返回 (Returns):
-    - 负的验证集/测试集 R2 分数 (skopt minimize 最小化目标)
-    """
+
+
     global GLOBAL_ITER, BEST_RESULT, LAST_TRAINED_MODEL
     GLOBAL_ITER += 1
     iter_id = GLOBAL_ITER
@@ -8105,7 +7885,7 @@ def objective(
     top_state_records = []
 
     for epoch in range(1, cfg.max_epochs + 1):
-        # 训练单个Epoch (包含因果不变性惩罚)
+
         train_stats = _train_epoch_causal_invariant(
             trainer=trainer,
             dataloader=train_loader,
@@ -8114,19 +7894,19 @@ def objective(
             epoch=int(epoch),
             max_epochs=int(cfg.max_epochs),
         )
-        # 验证集评估
+
         snapshot_state = None
         _, val_r2_epoch, val_rmse_epoch = trainer.evaluate(val_loader)
 
         # V5: Use val for early stopping (avoid test set leakage)
-        # 监控指标 (Monitor Metric): 默认为验证集R2
+
         monitor_r2 = val_r2_epoch
         monitor_rmse = val_rmse_epoch
 
         if cfg.scheduler_type == "plateau" and trainer.scheduler is not None:
             trainer.scheduler.step(monitor_rmse if np.isfinite(monitor_rmse) else 1.0)
 
-        # 早停逻辑 (Early Stopping)
+
         improved = False
         if np.isfinite(monitor_r2):
             improved = monitor_r2 > best_monitor_r2 + cfg.min_delta
@@ -8155,11 +7935,31 @@ def objective(
             best_monitor_rmse = float(monitor_rmse)
             best_state = snapshot_state
             best_epoch = int(epoch)
-            # 维护Top-K个最佳checkpoint用于集成 (Checkpoint Ensemble)
+
             top_states.append((float(monitor_r2), int(epoch), copy.deepcopy(best_state)))
             top_states.sort(key=lambda x: float(x[0]), reverse=True)
             top_states = top_states[:topk_ckpt_ensemble]
             top_state_records = [{"epoch": int(ep), "val_r2": float(r2)} for r2, ep, _ in top_states]
+            # The original locked run retained these states only in memory.  Export
+            # them in the rebuild so the Top-K inference rule is reproducible.
+            checkpoint_export = os.environ.get("DECAT_EXPORT_TOP_CHECKPOINTS", "").strip()
+            if checkpoint_export:
+                os.makedirs(checkpoint_export, exist_ok=True)
+                scores = [float(r2) for r2, _, _ in top_states]
+                if _env_bool_pair("TRANSFORMER_V3_CKPT_ENSEMBLE_WEIGHTED", None, True):
+                    weights = _softmax_weights(
+                        scores,
+                        temperature=float(_env_value("TRANSFORMER_V3_CKPT_ENSEMBLE_TEMP", None, "0.02")),
+                    )
+                else:
+                    weights = np.ones(len(scores), dtype=float) / float(len(scores))
+                manifest = {"states": [], "weights": [float(value) for value in weights]}
+                for rank, (score, saved_epoch, state) in enumerate(top_states, start=1):
+                    filename = f"top{rank}_epoch{int(saved_epoch)}.pth"
+                    torch.save({"state_dict": state, "epoch": int(saved_epoch), "val_r2": float(score)}, os.path.join(checkpoint_export, filename))
+                    manifest["states"].append({"file": filename, "epoch": int(saved_epoch), "val_r2": float(score)})
+                with open(os.path.join(checkpoint_export, "top_checkpoint_ensemble.json"), "w", encoding="utf-8") as handle:
+                    json.dump(manifest, handle, ensure_ascii=False, indent=2)
             patience = 0
         else:
             patience += 1
@@ -8173,12 +7973,12 @@ def objective(
     if best_state is not None:
         trainer.model.load_state_dict(best_state)
     LAST_TRAINED_MODEL = trainer.model
-    # 模型预测与集成 (Prediction & Checkpoint Ensemble)
+
     use_weighted_ckpt_ensemble = _env_bool_pair("TRANSFORMER_V3_CKPT_ENSEMBLE_WEIGHTED", None, True)
     ckpt_ensemble_temp = float(_env_value("TRANSFORMER_V3_CKPT_ENSEMBLE_TEMP", None, "0.02"))
-    
+
     if use_ckpt_ensemble and len(top_states) > 1:
-        # 使用Top-K Checkpoints进行集成预测
+
         state_pack = list(top_states[:topk_ckpt_ensemble])
         pred_train_list = []
         pred_val_list = []
@@ -8187,10 +7987,10 @@ def objective(
         y_train = pred_train = idx_train = None
         y_val = pred_val = idx_val = None
         y_test = pred_test = idx_test = None
-        
+
         for r2_ckpt, _, st in state_pack:
             trainer.model.load_state_dict(st)
-            # 对三个数据集进行预测
+
             (
                 y_train_i,
                 pred_train_i,
@@ -8217,7 +8017,7 @@ def objective(
             pred_test_list.append(np.asarray(pred_test_i, dtype=np.float32))
             state_scores.append(float(r2_ckpt))
 
-        # 计算加权平均 (Weighted Average)
+
         if use_weighted_ckpt_ensemble:
             w_ckpt = _softmax_weights(state_scores, temperature=ckpt_ensemble_temp)
         else:
@@ -8226,12 +8026,12 @@ def objective(
         pred_train = np.sum(np.vstack(pred_train_list) * w_col, axis=0).astype(np.float32)
         pred_val = np.sum(np.vstack(pred_val_list) * w_col, axis=0).astype(np.float32)
         pred_test = np.sum(np.vstack(pred_test_list) * w_col, axis=0).astype(np.float32)
-        
-        # 恢复最佳单模型状态，以便后续分析使用
+
+
         if best_state is not None:
             trainer.model.load_state_dict(best_state)
     else:
-        # 仅使用单一最佳模型 (Single Best Model)
+
         (
             y_train,
             pred_train,
@@ -8258,20 +8058,20 @@ def objective(
     fusion_note = "none"
     fusion_result = None
 
-    # 自适应融合 (Adaptive Fusion): 结合NN与其他机器学习模型
+
     use_fusion = _env_bool_pair("TRANSFORMER_V3_ENABLE_FUSION", "TRANSFORMER_V2_ENABLE_FUSION", True)
     if use_fusion and y_train.size > 20 and y_val.size > 10:
         if progress_log:
             print(f"[V5] Iter {iter_id} adaptive fusion ...", flush=True)
-        
-        # 准备融合所需的特征矩阵 (Fingerprints + Numeric Features)
+
+
         fp_scaled = dataset.fingerprint_scaled
         if top_idx is not None:
             fp_scaled = fp_scaled[:, top_idx]
         num_all = np.concatenate([dataset.ph_scaled, dataset.category], axis=1).astype(np.float32)
         x_all = np.concatenate([fp_scaled.astype(np.float32), num_all], axis=1).astype(np.float32)
 
-        # 确保索引一致性
+
         if idx_train.size > 0 and np.all(idx_train >= 0):
             x_train = x_all[idx_train]
         else:
@@ -8285,7 +8085,7 @@ def objective(
         else:
             x_test = x_all[test_idx]
 
-        # 调用自适应融合函数
+
         fusion_result = _adaptive_fusion(
             y_train=y_train,
             y_val=y_val,
@@ -8357,10 +8157,10 @@ def objective(
         f"lr={cfg.learning_rate:.5f} | wd={cfg.weight_decay:.2e}"
     )
 
-    # 报告结果 (Report Results)
+
     current_target_r2 = test_r2 if objective_target == "test" else val_r2
     objective_score = float(current_target_r2)
-    # 若在验证集上优化，对过拟合进行惩罚
+
     if (
         objective_target == "val"
         and np.isfinite(train_r2)
@@ -8368,8 +8168,8 @@ def objective(
         and generalization_penalty > 0.0
     ):
         objective_score -= float(generalization_penalty) * max(0.0, float(train_r2 - val_r2))
-    
-    # 检查是否为当前最佳结果 (Check if Best)
+
+
     is_best = np.isfinite(objective_score) and (objective_score > float(BEST_RESULT["objective_r2"]))
     if is_best:
         BEST_RESULT["iter"] = int(iter_id)
@@ -8814,7 +8614,7 @@ def _collect_bo_warm_start_points() -> list:
     warm_topn = max(0, min(12, warm_topn))
     if warm_topn > 0:
         patterns = [
-            os.path.join(OUT_DIR, "运行_*", "best_params.json"),
+            os.path.join(OUT_DIR, "run_*", "best_params.json"),
             os.path.join(OUT_DIR, "best_params_transformer_v7_innov_*.json"),
             os.path.join(OUT_DIR, "best_params_transformer_v6_innov_*.json"),
             os.path.join(OUT_DIR, "best_params_transformer_v5_innov_*.json"),
@@ -9092,9 +8892,8 @@ def run_final_retrain_on_trainval() -> None:
 
 
 def run_bayesian_optimization() -> None:
-    """
-    运行完整的贝叶斯优化流程 (Bayesian Optimization Loop).
-    """
+
+
     global GLOBAL_ITER, SPLIT_CACHE, FP_RANK_CACHE, RUN_OUTPUT_DIR
     GLOBAL_ITER = 0
     SPLIT_CACHE = {}
@@ -9118,7 +8917,7 @@ def run_bayesian_optimization() -> None:
     print("=" * 108)
     print(" iter | R2_train | RMSE_train | R2_val | RMSE_val | R2_eval | RMSE_eval | model | fp_bits | topk | tok | dm | h | ly | bs | dr | ep |   lr   |   wd")
 
-    # 1. 收集热启动点 (Warm Start Points)
+
     warm_points = _collect_bo_warm_start_points()
     if warm_points:
         max_x0 = max(0, int(n_calls) - 1)
@@ -9130,7 +8929,7 @@ def run_bayesian_optimization() -> None:
         if warm_points:
             print(f"[V5] BO warm-start points: {len(warm_points)} | adjusted n_initial_points: {n_initial_points}")
 
-    # 2. 执行贝叶斯优化 (Execute BO)
+
     gp_kwargs = dict(
         func=objective,
         dimensions=space,
@@ -9150,7 +8949,7 @@ def run_bayesian_optimization() -> None:
     print(f"Best objective ({objective_target}) R2 = {best_obj:.4f}")
     # ... (log best results)
 
-    # 3. 最终导出与确认 (Final Export & Confirmation)
+
     defer_best_export = _env_bool_pair("TRANSFORMER_V3_DEFER_BEST_EXPORT", None, True)
     skip_artifacts = _env_bool_pair("TRANSFORMER_V3_SKIP_ARTIFACTS", "TRANSFORMER_V2_SKIP_ARTIFACTS", False)
     if defer_best_export and (not skip_artifacts):
@@ -9225,7 +9024,7 @@ def _normalize_model_mode(model_mode: str) -> str:
 
 def _find_latest_best_params_json() -> Optional[str]:
     patterns = [
-        os.path.join(OUT_DIR, "运行_*", "best_params.json"),
+        os.path.join(OUT_DIR, "run_*", "best_params.json"),
         os.path.join(OUT_DIR, "best_params_transformer_v7_innov_*.json"),
         os.path.join(OUT_DIR, "best_params_transformer_v6_innov_*.json"),
         os.path.join(OUT_DIR, "best_params_transformer_v5_innov_*.json"),
@@ -9773,13 +9572,8 @@ def run_ablation_significance() -> None:
 
 
 def main() -> None:
-    """
-    主程序入口。
-    根据环境变量控制运行模式：
-    1. 贝叶斯优化 (bo) - 默认模式
-    2. 消融实验 (ablation) - 验证组件有效性
-    3. 统计显著性测试 (significance)
-    """
+
+
     mode = str(
         _env_value(
             "TRANSFORMER_V7_MODE",
@@ -9794,7 +9588,7 @@ def main() -> None:
     )
     run_ablation_after_bo = _env_bool_pair("TRANSFORMER_V7_RUN_ABLATION_AFTER_BO", "TRANSFORMER_V6_RUN_ABLATION_AFTER_BO", _env_bool_pair("TRANSFORMER_V3_RUN_ABLATION_AFTER_BO", None, False))
     run_final_retrain = _env_bool_pair("TRANSFORMER_V7_RUN_FINAL_RETRAIN", "TRANSFORMER_V6_RUN_FINAL_RETRAIN", False) or mode in {"retrain", "final_retrain"}
-    
+
     if run_ablation_only:
         run_ablation_significance()
         return
@@ -9810,11 +9604,11 @@ def main() -> None:
     if mode in {"retrain", "final_retrain"}:
         run_final_retrain_on_trainval()
         return
-        
-    # 执行贝叶斯优化
+
+
     run_bayesian_optimization()
 
-    # Plan B: 在优化完成后，使用最佳超参数在 Train+Val 上重新训练 (Retrain on train+val after BO completes)
+
     if run_final_retrain:
         run_final_retrain_on_trainval()
 

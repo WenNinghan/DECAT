@@ -1,278 +1,53 @@
-# -*- coding: utf-8 -*-
-"""
-Streamlit 封装版 - 二级反应速率常数logk预测系统（超参数可自定义）
-流程：化学物质名称 → CAS号查询 → SMILES获取 → 分子指纹生成 → 类别匹配 → pH选择 → logk预测
-核心特性：所有ANN超参数在侧边栏可视化配置，无需修改代码
-依赖：需提前安装 streamlit, pandas, requests, beautifulsoup4, rdkit-pypi, torch, scikit-learn
-运行方式：streamlit run 本文件名称.py
-"""
+"""Predict aqueous ozone reaction-rate constants with the trained DECAT ensemble."""
 import os
 import re
 import io
 import base64
 import json
 import pickle
-import importlib
 import importlib.util
-import numpy as np
-import pandas as pd
-import requests
-import streamlit as st
-from bs4 import BeautifulSoup
-from urllib.parse import quote
-from rdkit import Chem
-from rdkit import RDLogger
-from rdkit.Chem import rdFingerprintGenerator
-from rdkit.Chem import Draw
-import torch
-import torch.nn as nn
-from sklearn.ensemble import ExtraTreesRegressor, HistGradientBoostingRegressor, RandomForestRegressor
-from sklearn.preprocessing import StandardScaler
-from streamlit.runtime.scriptrunner import get_script_run_ctx
 import sys
 import subprocess
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 from html import escape
 
-# The release is self-contained.  All runtime assets are resolved relative to
-# this file so the platform can be copied to another machine or folder.
+import numpy as np
+import pandas as pd
+import requests
+import streamlit as st
+from bs4 import BeautifulSoup
+from urllib.parse import quote
+from rdkit import Chem, RDLogger
+from rdkit.Chem import rdFingerprintGenerator, Draw
+import torch
+import torch.nn as nn
+from streamlit.runtime.scriptrunner import get_script_run_ctx
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 RELEASE_ROOT = SCRIPT_DIR.parent
-PROJECT_DIR = RELEASE_ROOT
-if str(PROJECT_DIR) not in sys.path:
-    sys.path.append(str(PROJECT_DIR))
+DEPLOYMENT_ARTIFACTS = SCRIPT_DIR / "artifacts"
+RUNTIME_PACKAGE = RELEASE_ROOT / "core" / "locked_package"
+RUNTIME_CONFIG_PATH = RUNTIME_PACKAGE / "configs" / "LOCKED_SEEN25_1626_NONUNIFORM_SOTA.json"
+RUNTIME_DATASET_PATH = RUNTIME_PACKAGE / "data" / "decat_features_1626.csv"
+RUNTIME_SPLIT_PATH = RUNTIME_PACKAGE / "data" / "split_seed242_1626.json"
+PAPER_REBUILD_PACKAGE = RUNTIME_PACKAGE
+PAPER_REBUILD_CONFIG_PATH = RUNTIME_CONFIG_PATH
+PAPER_REBUILD_ROOT = DEPLOYMENT_ARTIFACTS
+PAPER_TOP3_MANIFEST_PATH = DEPLOYMENT_ARTIFACTS / "top_checkpoints" / "top_checkpoint_ensemble.json"
+PAPER_RESIDUAL_MANIFEST_PATH = DEPLOYMENT_ARTIFACTS / "residual_rf" / "residual_rf_manifest.json"
+CATEGORY_OVERRIDES_PATH = SCRIPT_DIR / "data" / "category_overrides.csv"
 
-# ======================== 基础配置（固定参数，非超参数） ========================
-# 禁用RDKit警告
 RDLogger.DisableLog('rdApp.warning')
 RDLogger.DisableLog('rdApp.info')
+FP_SIZE = 3147
+RADIUS = 2
 
-# 旧版ANN类别映射（名称→编码）
-LEGACY_CATEGORY_MAP = {
-    "烷烃 / Alkane": 0,
-    "脂肪醇 / Alcohol": 1,
-    "脂肪二醇 / Diol": 2,
-    "醚 / Ether": 3,
-    "酮 / Ketone": 4,
-    "醛 / Aldehyde": 5,
-    "酯 / Ester": 6,
-    "羧酸 / Carboxyl": 7,
-    "二元羧酸 / Dicarboxylic": 8,
-    "脂肪卤代物 / Halogenated": 9,
-    "硫化物 / Disulfide": 10,
-    "烯烃 / Alkene": 11,
-    "苯类 / Benzene": 12,
-    "酚类 / Phenol": 13,
-    "未知化合物": 14
-}
-LEGACY_CATEGORY_REVERSE = {v: k for k, v in LEGACY_CATEGORY_MAP.items()}
-LEGACY_CATEGORY_CODES = set(LEGACY_CATEGORY_MAP.values())
-
-
-def legacy_category_name_from_code(code: int) -> str:
-    """Return display name for a legacy ANN category code."""
-    return LEGACY_CATEGORY_REVERSE.get(code, "未知化合物")
-
-
-def legacy_category_name_en_from_code(code: int) -> str:
-    raw = legacy_category_name_from_code(code)
-    if " / " in raw:
-        return raw.split(" / ", 1)[1].strip()
-    if "/" in raw:
-        return raw.split("/", 1)[1].strip()
-    return raw
-
-
-FAMILY12_CLASSES = [
-    {
-        "code": "C1",
-        "name_en": "Inorganic / organometallic",
-        "name_cn": "无机物 / 有机金属化合物",
-        "desc_cn": "无碳骨架，或含明显金属 / 准金属中心。",
-    },
-    {
-        "code": "C2",
-        "name_en": "Carboxylic acids / carboxylates",
-        "name_cn": "羧酸 / 羧酸盐",
-        "desc_cn": "以游离羧酸或羧酸盐官能团为主。",
-    },
-    {
-        "code": "C3",
-        "name_en": "Phenols / phenolates",
-        "name_cn": "酚类 / 酚盐",
-        "desc_cn": "含芳香羟基或酚盐结构。",
-    },
-    {
-        "code": "C4",
-        "name_en": "Organosulfur compounds",
-        "name_cn": "有机硫化合物",
-        "desc_cn": "含硫中心有机官能团或硫杂环骨架。",
-    },
-    {
-        "code": "C5",
-        "name_en": "Amides / ureas / imides / carbamates",
-        "name_cn": "酰胺 / 尿素 / 酰亚胺 / 氨基甲酸酯",
-        "desc_cn": "含酰胺型含氮羰基结构。",
-    },
-    {
-        "code": "C6",
-        "name_en": "Esters / lactones / carbonates",
-        "name_cn": "酯 / 内酯 / 碳酸酯",
-        "desc_cn": "含酯、内酯或碳酸酯型含氧羰基结构。",
-    },
-    {
-        "code": "C7",
-        "name_en": "Aldehydes / ketones",
-        "name_cn": "醛 / 酮",
-        "desc_cn": "以醛基或酮基为主，且无更高优先级官能团。",
-    },
-    {
-        "code": "C8",
-        "name_en": "Alcohols / polyols",
-        "name_cn": "醇 / 多元醇",
-        "desc_cn": "以醇羟基、多元醇或糖样氧化结构为主。",
-    },
-    {
-        "code": "C9",
-        "name_en": "Ethers / epoxides / acetals",
-        "name_cn": "醚 / 环氧化物 / 缩醛",
-        "desc_cn": "以醚、环氧或缩醛型含氧结构为主。",
-    },
-    {
-        "code": "C10",
-        "name_en": "Organonitrogen compounds",
-        "name_cn": "有机含氮化合物",
-        "desc_cn": "含胺、腈、偶氮、硝基或含氮杂环等结构。",
-    },
-    {
-        "code": "C11",
-        "name_en": "Aromatics / heteroaromatics",
-        "name_cn": "芳香族 / 杂芳香族",
-        "desc_cn": "具有芳香骨架，但无更高优先级家族官能团。",
-    },
-    {
-        "code": "C12",
-        "name_en": "Hydrocarbons / halogenated aliphatics",
-        "name_cn": "烃类 / 脂肪族卤代物",
-        "desc_cn": "烃类或脂肪族卤代化合物，且无更强异原子主导结构。",
-    },
-]
-FAMILY12_CODE_TO_INFO = {item["code"]: item for item in FAMILY12_CLASSES}
-FAMILY12_EN_TO_INFO = {item["name_en"]: item for item in FAMILY12_CLASSES}
-FAMILY12_REASON_CN_MAP = {
-    "SMILES could not be parsed reliably": "SMILES 无法被可靠解析，按无机 / 有机金属类兜底处理。",
-    "No carbon skeleton or contains a metal / metalloid center": "不存在明确碳骨架，或含金属 / 准金属中心。",
-    "Contains free carboxylic acid or carboxylate functionality": "检测到游离羧酸或羧酸盐官能团。",
-    "Contains aromatic hydroxyl / phenolate motif": "检测到芳香羟基 / 酚盐结构。",
-    "Contains sulfur-centered organic functionality or sulfur heterocycle": "检测到以硫为核心的有机官能团或硫杂环。",
-    "Contains amide-like carbonyl nitrogen functionality": "检测到酰胺样含氮羰基结构。",
-    "Contains ester-, lactone- or carbonate-type oxygenated carbonyl": "检测到酯、内酯或碳酸酯型含氧羰基结构。",
-    "Contains aldehyde or ketone carbonyl without higher-priority family": "检测到醛或酮羰基，且无更高优先级家族结构。",
-    "Dominant family is alcohol / polyol / carbohydrate-like oxygenation": "整体更符合醇 / 多元醇 / 糖样氧化家族特征。",
-    "Dominant oxygenated family is ether / epoxide / acetal-like": "整体更符合醚 / 环氧 / 缩醛型含氧结构。",
-    "Contains nitrogen-centered organic functionality or N-heteroaromatic scaffold": "检测到含氮官能团或含氮杂芳环骨架。",
-    "Aromatic scaffold without higher-priority family-defining functionality": "为芳香 / 杂芳香骨架，且无更高优先级官能团。",
-    "Hydrocarbon or halogenated aliphatic family without stronger heteroatom-defining motif": "属于烃类或脂肪族卤代物，且无更强的异原子主导结构。",
-}
-FAMILY12_ALIAS_TO_CODE = {
-    "c1": "C1",
-    "无机": "C1",
-    "有机金属": "C1",
-    "organometallic": "C1",
-    "inorganic": "C1",
-    "c2": "C2",
-    "羧酸": "C2",
-    "carbox": "C2",
-    "c3": "C3",
-    "酚": "C3",
-    "phenol": "C3",
-    "c4": "C4",
-    "有机硫": "C4",
-    "sulfur": "C4",
-    "sulfur compounds": "C4",
-    "c5": "C5",
-    "酰胺": "C5",
-    "尿素": "C5",
-    "氨基甲酸酯": "C5",
-    "amide": "C5",
-    "urea": "C5",
-    "imide": "C5",
-    "carbamate": "C5",
-    "c6": "C6",
-    "酯": "C6",
-    "内酯": "C6",
-    "碳酸酯": "C6",
-    "ester": "C6",
-    "lactone": "C6",
-    "carbonate": "C6",
-    "c7": "C7",
-    "醛": "C7",
-    "酮": "C7",
-    "aldehyde": "C7",
-    "ketone": "C7",
-    "c8": "C8",
-    "醇": "C8",
-    "多元醇": "C8",
-    "alcohol": "C8",
-    "polyol": "C8",
-    "c9": "C9",
-    "醚": "C9",
-    "环氧": "C9",
-    "缩醛": "C9",
-    "ether": "C9",
-    "epoxide": "C9",
-    "acetal": "C9",
-    "c10": "C10",
-    "含氮": "C10",
-    "有机氮": "C10",
-    "nitrogen": "C10",
-    "amine": "C10",
-    "nitrile": "C10",
-    "c11": "C11",
-    "芳香": "C11",
-    "杂芳香": "C11",
-    "aromatic": "C11",
-    "heteroaromatic": "C11",
-    "c12": "C12",
-    "烃": "C12",
-    "卤代": "C12",
-    "halogenated": "C12",
-    "hydrocarbon": "C12",
-}
-
-REFERENCE27_CLASSES = [
-    {"code": "A", "name_en": "Alkane"},
-    {"code": "B", "name_en": "Alcohol"},
-    {"code": "C", "name_en": "Diol"},
-    {"code": "D", "name_en": "Ether"},
-    {"code": "E", "name_en": "Ketone"},
-    {"code": "F", "name_en": "Aldehyde"},
-    {"code": "G", "name_en": "Ester"},
-    {"code": "H", "name_en": "Carboxyl"},
-    {"code": "I", "name_en": "Dicarboxylic"},
-    {"code": "J", "name_en": "Halogenated"},
-    {"code": "K", "name_en": "Sulfide, disulfide"},
-    {"code": "L", "name_en": "Sulfoxide"},
-    {"code": "M", "name_en": "Thiol"},
-    {"code": "N", "name_en": "Nitrile"},
-    {"code": "O", "name_en": "Nitro"},
-    {"code": "P", "name_en": "Amide"},
-    {"code": "Q", "name_en": "Amine"},
-    {"code": "R", "name_en": "Nitroso, nitramine"},
-    {"code": "S", "name_en": "Phosphorus"},
-    {"code": "T", "name_en": "Cyclo"},
-    {"code": "U", "name_en": "Alkene"},
-    {"code": "V", "name_en": "Benzene"},
-    {"code": "W", "name_en": "Pyridine"},
-    {"code": "X", "name_en": "Furan"},
-    {"code": "Y", "name_en": "Urea"},
-    {"code": "Z", "name_en": "Imidazole"},
-    {"code": "A2", "name_en": "Triazine"},
-]
-REFERENCE27_CODE_TO_INFO = {item["code"]: item for item in REFERENCE27_CLASSES}
-REFERENCE27_NAME_TO_INFO = {item["name_en"].lower(): item for item in REFERENCE27_CLASSES}
-REFERENCE27_LABEL_TO_INFO = {f"{item['code']}: {item['name_en']}".lower(): item for item in REFERENCE27_CLASSES}
+# Training leave-one-out distance thresholds in the selected fingerprint space.
+AD_STRICT_DISTANCE_THRESHOLD = 0.6428571428571428
+AD_BORDERLINE_DISTANCE_THRESHOLD = 0.8
+PH_TRAIN_MIN = 1.0
+PH_TRAIN_MAX = 12.0
 
 LOCKED_CATEGORY27_LABELS = {
     "A": "A: Other aqueous environmental species",
@@ -303,228 +78,14 @@ LOCKED_CATEGORY27_LABELS = {
 }
 LOCKED_CATEGORY27_OPTIONS = list(LOCKED_CATEGORY27_LABELS.values())
 
-# 分子指纹固定参数（若需修改可移至侧边栏）
-FP_SIZE = 4096  # Morgan指纹长度
-RADIUS = 2  # Morgan指纹半径
-gen = rdFingerprintGenerator.GetMorganGenerator(radius=RADIUS, fpSize=FP_SIZE)
-
-# 设备配置（自动识别GPU/CPU）
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-# ---------------------------------------------------------------------------
-# Self-contained release paths
-# ---------------------------------------------------------------------------
-DEPLOYMENT_ARTIFACTS = SCRIPT_DIR / "artifacts"
-RUNTIME_PACKAGE = DEPLOYMENT_ARTIFACTS / "runtime_package"
-RUNTIME_CONFIG_PATH = RUNTIME_PACKAGE / "configs" / "LOCKED_SEEN25_1626_NONUNIFORM_SOTA.json"
-RUNTIME_DATASET_PATH = RUNTIME_PACKAGE / "data" / "反应logk指纹数据_25类_含环境无机物_Other_1626条.csv"
-RUNTIME_SPLIT_PATH = RUNTIME_PACKAGE / "data" / "固定划分_1626_同分子异pH非均分_75-12.5-12.5.json"
-LOCKED_PACKAGE_ROOT = RELEASE_ROOT / "core" / "locked_package"
-
-DATASET_CANDIDATES = [
-    os.environ.get("LOGK_DATASET_PATH", "").strip(),
-    str(RUNTIME_DATASET_PATH),
-    str(LOCKED_PACKAGE_ROOT / "data" / "反应logk指纹数据_25类_含环境无机物_Other_1626条.csv"),
-]
-
-
-def _first_existing_path(candidates):
-    for p in candidates:
-        if not p:
-            continue
-        if os.path.exists(p):
-            return os.path.abspath(p)
-    return None
-
-
-DATASET_PATH = _first_existing_path(DATASET_CANDIDATES) or str(RUNTIME_DATASET_PATH)
-
-V9_LOCKED_RUN_DIR = LOCKED_PACKAGE_ROOT / "artifacts" / "run"
-V9_LOCKED_MODEL_PATH = V9_LOCKED_RUN_DIR / "transformer_v7_best.pth"
-V9_LOCKED_PARAMS_PATH = V9_LOCKED_RUN_DIR / "best_params.json"
-V9_LOCKED_SUMMARY_PATH = V9_LOCKED_RUN_DIR / "fixed_params_run_summary.json"
-V9_LOCKED_DATASET_PATH = LOCKED_PACKAGE_ROOT / "data" / "反应logk指纹数据_25类_含环境无机物_Other_1626条.csv"
-V9_LOCKED_SPLIT_PATH = LOCKED_PACKAGE_ROOT / "data" / "固定划分_1626_同分子异pH非均分_75-12.5-12.5.json"
-V9_LOCKED_FUSION_COMPONENTS_PATH = LOCKED_PACKAGE_ROOT / "artifacts" / "predictions" / "fusion_components.npz"
-V9_LOCKED_RUNTIME_PATH = LOCKED_PACKAGE_ROOT / "src" / "decat" / "transformer_v9_transformer_centered.py"
-V9_LOCKED_TEST_R2 = 0.8286396449402338
-V9_LOCKED_TEST_RMSE = 1.1624043383268383
-
-PAPER_EXTERNAL_ROOT = SCRIPT_DIR / "data"
-PAPER_REBUILD_ROOT = DEPLOYMENT_ARTIFACTS
-PAPER_REBUILD_PACKAGE = RUNTIME_PACKAGE
-PAPER_REBUILD_CONFIG_PATH = RUNTIME_CONFIG_PATH
-PAPER_TOP3_MANIFEST_PATH = DEPLOYMENT_ARTIFACTS / "top_checkpoints" / "top_checkpoint_ensemble.json"
-PAPER_RESIDUAL_MANIFEST_PATH = DEPLOYMENT_ARTIFACTS / "residual_rf" / "residual_rf_manifest.json"
-PAPER_FUSION_COMPONENTS_PATH = DEPLOYMENT_ARTIFACTS / "fusion_components.npz"
-PAPER_EXTERNAL_CASES_PATH = SCRIPT_DIR / "data" / "external_validation_10.csv"
-
-# Seed-242 applicability-domain route used for the complete 4,295-structure
-# screen (LOO q95/q99 in the selected 914-bit space).
-AD_STRICT_DISTANCE_THRESHOLD = 0.6428571428571428
-AD_BORDERLINE_DISTANCE_THRESHOLD = 0.8
-AD_STRICT_SIMILARITY_THRESHOLD = 1.0 - AD_STRICT_DISTANCE_THRESHOLD
-AD_BORDERLINE_SIMILARITY_THRESHOLD = 1.0 - AD_BORDERLINE_DISTANCE_THRESHOLD
-PH_TRAIN_MIN = 1.0
-PH_TRAIN_MAX = 12.0
-
-HIGH_THROUGHPUT_RESULT_DIR = RELEASE_ROOT / "screening" / "results"
-HIGH_THROUGHPUT_INPUT_DIR = RELEASE_ROOT / "screening" / "input"
-HIGH_THROUGHPUT_COMBINED_ROW_RESULTS = HIGH_THROUGHPUT_RESULT_DIR / "AD_seed242_row_level_results.csv"
-HIGH_THROUGHPUT_COMBINED_UNIQUE_RESULTS = HIGH_THROUGHPUT_RESULT_DIR / "AD_seed242_unique_compound_results.csv"
-HIGH_THROUGHPUT_COMBINED_METADATA = HIGH_THROUGHPUT_RESULT_DIR / "AD_seed242_summary.json"
-HIGH_THROUGHPUT_TOP_BITS = HIGH_THROUGHPUT_RESULT_DIR / "seed242_selected_bit_indices.txt"
-
-
-def _normalize_v6_mode(mode: str) -> str:
-    mode_text = str(mode or "").strip().lower()
-    if "+" in mode_text:
-        mode_text = mode_text.split("+", 1)[0]
-    if mode_text not in {"dual", "attn", "mlp"}:
-        mode_text = "dual"
-    return mode_text
-
 
 def _load_json_file(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def _extract_v6_payload_fields(payload: dict) -> Tuple[dict, dict, str]:
-    params = payload.get("params", payload)
-    payload_env = payload.get("env", {}) if isinstance(payload, dict) else {}
-    dataset_path = str(
-        payload.get("dataset")
-        or payload.get("data_csv_path")
-        or payload_env.get("TRANSFORMER_V6_DATA_CSV", "")
-    ).strip()
-    return params, payload_env, dataset_path
-
-
-def _find_compatible_v6_checkpoint(params_path: str) -> str:
-    run_root = PROJECT_DIR / "transformer_v6" / "transformer"
-    if not run_root.exists():
-        return ""
-
-    try:
-        target_payload = _load_json_file(params_path)
-        target_params, _, _ = _extract_v6_payload_fields(target_payload)
-    except Exception:
-        target_params = {}
-
-    exact_keys = [
-        "fp_bits",
-        "topk_features",
-        "d_model",
-        "max_fp_tokens",
-        "n_layers",
-        "n_heads",
-        "enable_chem_attn_bias",
-        "enable_category_fusion",
-        "norm_first",
-    ]
-    mode_target = _normalize_v6_mode(target_params.get("model_mode", "dual"))
-    best_match = ""
-    best_score = -1
-
-    run_dirs = sorted(
-        [p for p in run_root.glob("运行_*") if p.is_dir()],
-        key=lambda x: x.stat().st_mtime,
-        reverse=True,
-    )
-    for run_dir in run_dirs:
-        model_path = run_dir / "transformer_v6_best.pth"
-        params_candidate = run_dir / "best_params.json"
-        if not (model_path.exists() and params_candidate.exists()):
-            continue
-        score = 0
-        try:
-            cand_payload = _load_json_file(str(params_candidate))
-            cand_params, _, _ = _extract_v6_payload_fields(cand_payload)
-            if _normalize_v6_mode(cand_params.get("model_mode", "dual")) != mode_target:
-                continue
-            for key in exact_keys:
-                if key in target_params and str(cand_params.get(key)) == str(target_params.get(key)):
-                    score += 1
-        except Exception:
-            score = 0
-        if score > best_score:
-            best_score = score
-            best_match = str(model_path)
-            if score >= len(exact_keys):
-                break
-    return best_match
-
-
-def _find_latest_v6_artifacts():
-    v6_root = PROJECT_DIR / "transformer_v6" / "transformer"
-    if v6_root.exists():
-        run_dirs = sorted(v6_root.glob("运行_*"), key=lambda x: x.stat().st_mtime, reverse=True)
-        for run_dir in run_dirs:
-            model_path = run_dir / "transformer_v6_best.pth"
-            params_path = run_dir / "best_params.json"
-            if not (model_path.exists() and params_path.exists()):
-                continue
-            dataset_path = DATASET_PATH
-            try:
-                payload = _load_json_file(str(params_path))
-                _, _, payload_dataset = _extract_v6_payload_fields(payload)
-                if payload_dataset and os.path.exists(payload_dataset):
-                    dataset_path = payload_dataset
-            except Exception:
-                dataset_path = DATASET_PATH
-            return str(model_path), str(params_path), dataset_path
-
-    recommended_params = v6_root / "fixed_recommended_params_family12_scope_filtered_tuned_ema_20260324.json"
-    params_path = str(recommended_params) if recommended_params.exists() else ""
-    model_path = _find_compatible_v6_checkpoint(params_path) if params_path else ""
-    return model_path, params_path, DATASET_PATH
-
-
-def _find_locked_v9_artifacts():
-    """Return only the current locked SEEN25-1626 package artifacts."""
-    return (
-        str(V9_LOCKED_MODEL_PATH),
-        str(V9_LOCKED_PARAMS_PATH),
-        str(V9_LOCKED_DATASET_PATH),
-        str(V9_LOCKED_SUMMARY_PATH),
-    )
-
-
-def _find_latest_v4_artifacts():
-    """Find latest V4 checkpoint + params from transformer run folders."""
-    run_root = PROJECT_DIR / "transformer"
-    if not run_root.exists():
-        return "", ""
-
-    run_dirs = sorted(
-        [p for p in run_root.glob("运行_*") if p.is_dir()],
-        key=lambda x: x.stat().st_mtime,
-        reverse=True,
-    )
-    for d in run_dirs:
-        model_path = d / "transformer_v4_best.pth"
-        params_path = d / "best_params.json"
-        if model_path.exists() and params_path.exists():
-            return str(model_path), str(params_path)
-
-    # Fallbacks
-    model_fallback = PROJECT_DIR / "transformer_v4_best.pth"
-    params_fallback = PROJECT_DIR / "best_params_transformer_v4_innov_latest.json"
-    return (str(model_fallback) if model_fallback.exists() else "", str(params_fallback) if params_fallback.exists() else "")
-
-
-def _find_latest_ann_checkpoint() -> str:
-    ann_root = PROJECT_DIR / "对比试验" / "运行结果" / "ANN"
-    if ann_root.exists():
-        for cand in sorted(ann_root.glob("运行_*/best_model.pth"), key=lambda x: x.stat().st_mtime, reverse=True):
-            return str(cand)
-    fallback = PROJECT_DIR / "ann_regressor.pth"
-    return str(fallback) if fallback.exists() else ""
-
-# ======================== 工具函数定义 ========================
 def read_csv_robust(path, **kwargs):
-    """健壮的CSV读取函数（兼容多编码）"""
+    """Read a CSV with common encoding fallbacks."""
     kwargs = dict(kwargs)
     kwargs.setdefault("low_memory", False)
     encodings_order = ["utf-8", "utf-8-sig", "gb18030", "gbk", "cp936", "latin1"]
@@ -537,7 +98,7 @@ def read_csv_robust(path, **kwargs):
             last_err = e
         except Exception as e:
             last_err = e
-    # 兜底方案
+
     try:
         with open(path, "rb") as f:
             raw = f.read()
@@ -552,12 +113,12 @@ def read_csv_robust(path, **kwargs):
                 continue
     except Exception as e:
         last_err = e
-    raise last_err or UnicodeDecodeError("无法解码CSV文件")
+    raise last_err or UnicodeDecodeError("Cannot decode the CSV file")
 
 
-@st.cache_data(ttl=3600)  # 缓存CAS查询结果1小时
+@st.cache_data(ttl=3600)
 def get_cas_from_chemsrc(chemical_name):
-    """从Chemsrc查询CAS号"""
+    """Query Chemsrc for a CAS number."""
     if not chemical_name or chemical_name.strip() == "":
         return None
     try:
@@ -579,7 +140,7 @@ def get_cas_from_chemsrc(chemical_name):
 
 @st.cache_data(ttl=3600)
 def get_cas_from_pubchem(chemical_name):
-    """从 PubChem 同义词列表中提取 CAS 号。"""
+    """Extract a CAS number from PubChem synonyms."""
     if not chemical_name or str(chemical_name).strip() == "":
         return None
     try:
@@ -609,7 +170,7 @@ def get_cas_from_pubchem(chemical_name):
 
 
 def get_cas_number(chemical_name):
-    """优先 Chemsrc，失败后回退到 PubChem。"""
+    """Query Chemsrc first, then fall back to PubChem."""
     cas = get_cas_from_chemsrc(chemical_name)
     if cas:
         return cas, "Chemsrc"
@@ -619,9 +180,9 @@ def get_cas_number(chemical_name):
     return None, ""
 
 
-@st.cache_data(ttl=3600)  # 缓存SMILES查询结果1小时
+@st.cache_data(ttl=3600)
 def get_smiles_via_api(compound_name, cas_number=None):
-    """优先PubChem查询SMILES，失败时回退到CACTUS，支持名称和CAS双通道。"""
+    """Resolve SMILES through PubChem or CACTUS using a name or CAS number."""
     name = (compound_name or "").strip()
     cas = (cas_number or "").strip()
     if name == "" and cas == "":
@@ -671,7 +232,7 @@ def get_smiles_via_api(compound_name, cas_number=None):
             f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{encoded}/property/CanonicalSMILES/TXT",
             f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{encoded}/JSON",
         ]
-        for _ in range(2):  # 轻量重试，缓解偶发网络抖动
+        for _ in range(2):
             for u in urls:
                 try:
                     smi = _read_smiles_txt(u) if u.endswith("/TXT") else _read_pubchem_smiles_json(u)
@@ -715,7 +276,7 @@ def get_smiles_via_api(compound_name, cas_number=None):
                 continue
         return None
 
-    # 优先：名称（PubChem）→ CAS（PubChem）→ 名称/CAS（CACTUS）
+
     if name:
         smi = _query_pubchem_name(name)
         if smi:
@@ -738,7 +299,7 @@ def get_smiles_via_api(compound_name, cas_number=None):
 
 
 def smiles_to_fingerprint(smiles, fp_size=FP_SIZE):
-    """将SMILES转换为分子指纹"""
+    """Convert SMILES to a Morgan fingerprint."""
     if pd.isna(smiles) or str(smiles).strip() == "":
         return None
     try:
@@ -753,362 +314,14 @@ def smiles_to_fingerprint(smiles, fp_size=FP_SIZE):
         return None
 
 
-def match_chemical_category(chemical_name):
-    """根据化学名称匹配类别"""
-    if not chemical_name:
-        return 14
-    name_lower = chemical_name.lower().strip()
-    if "烷" in chemical_name or "alkane" in name_lower:
-        return 0
-    elif "醇" in chemical_name and "二醇" not in chemical_name or "alcohol" in name_lower and "diol" not in name_lower:
-        return 1
-    elif "二醇" in chemical_name or "diol" in name_lower:
-        return 2
-    elif "醚" in chemical_name or "ether" in name_lower:
-        return 3
-    elif "酮" in chemical_name or "ketone" in name_lower:
-        return 4
-    elif "醛" in chemical_name or "aldehyde" in name_lower:
-        return 5
-    elif "酯" in chemical_name or "ester" in name_lower:
-        return 6
-    elif "羧酸" in chemical_name and "二元" not in chemical_name or "carboxyl" in name_lower and "dicarboxylic" not in name_lower:
-        return 7
-    elif "二元羧酸" in chemical_name or "dicarboxylic" in name_lower:
-        return 8
-    elif "卤" in chemical_name or "halogen" in name_lower:
-        return 9
-    elif "硫化物" in chemical_name or "disulfide" in name_lower:
-        return 10
-    elif "烯" in chemical_name or "alkene" in name_lower:
-        return 11
-    elif "苯" in chemical_name or "benzene" in name_lower:
-        return 12
-    elif "酚" in chemical_name or "phenol" in name_lower:
-        return 13
-    else:
-        return 14
-
-
-# ======================== 动态超参数ANN模型定义 ========================
-class DynamicANNRegressor(nn.Module):
-    """根据侧边栏配置动态构建的ANN回归模型"""
-
-    def __init__(self, input_dim, hidden_layer_sizes, dropout_rate=0.2):
-        super().__init__()
-        layers = []
-        # 输入层 → 第一层隐藏层
-        prev_dim = input_dim
-        for curr_dim in hidden_layer_sizes:
-            layers.append(nn.Linear(prev_dim, curr_dim))
-            layers.append(nn.ReLU())
-            layers.append(nn.Dropout(dropout_rate))
-            prev_dim = curr_dim
-        # 输出层（回归任务，单输出）
-        layers.append(nn.Linear(prev_dim, 1))
-        self.model = nn.Sequential(*layers)
-
-    def forward(self, x):
-        # 仅压掉最后一维，保留 batch 维度，避免 batch=1 时返回 0 维数组
-        return self.model(x).squeeze(-1)
-
-
-def _infer_architecture_from_checkpoint(checkpoint, default_input_dim, default_hidden_layer_sizes, default_dropout):
-    """Infer architecture metadata from checkpoint; fallback to sidebar values."""
-    input_dim = int(default_input_dim)
-    hidden_layer_sizes = list(default_hidden_layer_sizes)
-    dropout = float(default_dropout)
-
-    if not isinstance(checkpoint, dict):
-        return input_dim, hidden_layer_sizes, dropout
-
-    ck_input_dim = checkpoint.get("input_dim")
-    if ck_input_dim is not None:
-        try:
-            input_dim = int(ck_input_dim)
-        except Exception:
-            pass
-
-    ck_hidden_sizes = checkpoint.get("hidden_layer_sizes")
-    if isinstance(ck_hidden_sizes, (list, tuple)) and len(ck_hidden_sizes) > 0:
-        try:
-            hidden_layer_sizes = [int(v) for v in ck_hidden_sizes]
-        except Exception:
-            pass
-    else:
-        params = checkpoint.get("params") if isinstance(checkpoint.get("params"), dict) else {}
-        params_hidden = params.get("hidden_dims") or params.get("hidden_layers")
-        if isinstance(params_hidden, (list, tuple)) and len(params_hidden) > 0:
-            try:
-                hidden_layer_sizes = [int(v) for v in params_hidden]
-            except Exception:
-                pass
-        ck_hidden_dim = checkpoint.get("hidden_dim")
-        ck_hidden_layers = checkpoint.get("hidden_layers")
-        if ck_hidden_dim is not None and ck_hidden_layers is not None:
-            try:
-                hidden_dim = int(ck_hidden_dim)
-                hidden_layers = int(ck_hidden_layers)
-                if hidden_dim > 0 and hidden_layers > 0:
-                    hidden_layer_sizes = [hidden_dim] * hidden_layers
-            except Exception:
-                pass
-
-    ck_dropout = checkpoint.get("dropout")
-    if ck_dropout is None and isinstance(checkpoint.get("params"), dict):
-        ck_dropout = checkpoint["params"].get("dropout")
-    if ck_dropout is not None:
-        try:
-            dropout = float(ck_dropout)
-        except Exception:
-            pass
-
-    return input_dim, hidden_layer_sizes, dropout
-
-
-def _remap_legacy_state_dict_to_dynamic(state_dict, hidden_layer_sizes):
-    """Remap hidden/output style keys to DynamicANNRegressor sequential keys."""
-    if not isinstance(state_dict, dict):
-        return state_dict
-
-    target_hidden_indices = [i * 3 for i in range(len(hidden_layer_sizes))]
-    output_index = len(hidden_layer_sizes) * 3
-
-    legacy_hidden_indices = set()
-    for key in state_dict.keys():
-        k = key[7:] if key.startswith("module.") else key
-        for prefix in ("hidden.", "model.hidden."):
-            if k.startswith(prefix):
-                tail = k[len(prefix):]
-                parts = tail.split(".")
-                if len(parts) >= 2 and parts[0].isdigit() and parts[1] in ("weight", "bias"):
-                    legacy_hidden_indices.add(int(parts[0]))
-                break
-    legacy_hidden_indices = sorted(legacy_hidden_indices)
-    idx_map = {}
-    if legacy_hidden_indices:
-        for old_idx, new_idx in zip(legacy_hidden_indices, target_hidden_indices):
-            idx_map[old_idx] = new_idx
-
-    remapped = {}
-    for key, val in state_dict.items():
-        k = key[7:] if key.startswith("module.") else key
-        new_key = k
-
-        if k.startswith("hidden."):
-            tail = k[len("hidden."):]
-            parts = tail.split(".")
-            if len(parts) >= 2 and parts[0].isdigit() and parts[1] in ("weight", "bias"):
-                old_idx = int(parts[0])
-                mapped_idx = idx_map.get(old_idx, old_idx)
-                new_key = f"model.{mapped_idx}.{parts[1]}"
-        elif k.startswith("model.hidden."):
-            tail = k[len("model.hidden."):]
-            parts = tail.split(".")
-            if len(parts) >= 2 and parts[0].isdigit() and parts[1] in ("weight", "bias"):
-                old_idx = int(parts[0])
-                mapped_idx = idx_map.get(old_idx, old_idx)
-                new_key = f"model.{mapped_idx}.{parts[1]}"
-        elif k.startswith("output."):
-            tail = k[len("output."):]
-            parts = tail.split(".")
-            if len(parts) >= 1 and parts[0] in ("weight", "bias"):
-                new_key = f"model.{output_index}.{parts[0]}"
-        elif k.startswith("model.output."):
-            tail = k[len("model.output."):]
-            parts = tail.split(".")
-            if len(parts) >= 1 and parts[0] in ("weight", "bias"):
-                new_key = f"model.{output_index}.{parts[0]}"
-        elif k.startswith("net."):
-            tail = k[len("net."):]
-            parts = tail.split(".")
-            if len(parts) >= 2 and parts[0].isdigit() and parts[1] in ("weight", "bias"):
-                new_key = f"model.{parts[0]}.{parts[1]}"
-
-        remapped[new_key] = val
-    return remapped
-
-
 def _load_module_from_file(module_name: str, file_path: str):
     spec = importlib.util.spec_from_file_location(module_name, file_path)
     if spec is None or spec.loader is None:
-        raise ImportError(f"无法加载模块：{module_name} <- {file_path}")
+        raise ImportError(f"Cannot load module: {module_name} <- {file_path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
-
-
-def _get_family12_runtime_module():
-    family12_path = PROJECT_DIR / "analyze_and_reclassify_categories_family12.py"
-    if not family12_path.exists():
-        raise FileNotFoundError(f"缺少 family12 分类脚本：{family12_path}")
-    return _load_module_from_file("_streamlit_family12_classifier", str(family12_path))
-
-
-def _get_category27_runtime_module():
-    category27_path = PROJECT_DIR / "transformer_v6" / "category27_classifier.py"
-    if not category27_path.exists():
-        raise FileNotFoundError(f"Missing category27 classifier script: {category27_path}")
-    return _load_module_from_file("_streamlit_category27_classifier", str(category27_path))
-
-
-def _apply_v6_runtime_env(params: dict, payload_env: dict):
-    base_mode = _normalize_v6_mode(params.get("model_mode", "dual"))
-    env_updates = {
-        "TRANSFORMER_V3_ENABLE_DUAL": "1" if base_mode == "dual" else "0",
-        "TRANSFORMER_V3_GATE_EXTRA_FEATURES": "1" if bool(params.get("gate_extra_features", True)) else "0",
-        "TRANSFORMER_V3_ENABLE_CORRECTION_HEAD": "1" if bool(params.get("enable_correction_head", True)) else "0",
-        "TRANSFORMER_V3_ENABLE_FUSION": "1" if bool(params.get("enable_fusion", True)) else "0",
-        "TRANSFORMER_V3_ENABLE_CATEGORY_FUSION": "1" if bool(params.get("enable_category_fusion", False)) else "0",
-        "TRANSFORMER_V3_ENABLE_CHEM_ATTN_BIAS": "1" if bool(params.get("enable_chem_attn_bias", True)) else "0",
-        "TRANSFORMER_V3_USE_CKPT_ENSEMBLE": "1" if bool(params.get("use_checkpoint_ensemble", True)) else "0",
-        "TRANSFORMER_V3_TOPK_CHECKPOINT_ENSEMBLE": str(int(params.get("topk_checkpoint_ensemble", 3))),
-        "TRANSFORMER_V3_CKPT_ENSEMBLE_WEIGHTED": "1" if bool(params.get("ckpt_ensemble_weighted", True)) else "0",
-        "TRANSFORMER_V3_CKPT_ENSEMBLE_TEMP": str(float(params.get("ckpt_ensemble_temp", 0.05))),
-        "TRANSFORMER_V4_LAMBDA_INV": str(float(params.get("lambda_inv", 0.2))),
-        "TRANSFORMER_V4_LAMBDA_DRO": str(float(params.get("lambda_dro", 0.3))),
-        "TRANSFORMER_V4_LAMBDA_PHYSICS": str(float(params.get("lambda_physics", 0.08))),
-        "TRANSFORMER_V4_DRO_TAU": str(float(params.get("dro_tau", 0.05))),
-        "TRANSFORMER_V3_GENERALIZATION_PENALTY": str(float(params.get("generalization_penalty", 0.03))),
-        "TRANSFORMER_V6_ENABLE_EMA": "1" if bool(params.get("use_ema", False)) else "0",
-        "TRANSFORMER_V6_EMA_DECAY": str(float(params.get("ema_decay", payload_env.get("TRANSFORMER_V6_EMA_DECAY", 0.998)))),
-        "TRANSFORMER_V6_EMA_WARMUP_STEPS": str(int(float(params.get("ema_warmup_steps", payload_env.get("TRANSFORMER_V6_EMA_WARMUP_STEPS", 120))))),
-    }
-    fixed_split = str(
-        payload_env.get("TRANSFORMER_V6_FIXED_SPLIT_JSON", params.get("fixed_split_json", ""))
-    ).strip()
-    if fixed_split and os.path.exists(fixed_split):
-        env_updates["TRANSFORMER_V6_FIXED_SPLIT_JSON"] = fixed_split
-    for key, value in payload_env.items():
-        if value is not None and str(value).strip() != "":
-            os.environ[str(key)] = str(value)
-    for key, value in env_updates.items():
-        os.environ[str(key)] = str(value)
-
-
-def _get_v6_runtime_module():
-    return importlib.import_module("transformer_v6.transformer_v6.core")
-
-
-def _get_v9_runtime_module():
-    return _load_module_from_file("_streamlit_decat_v9_runtime", str(V9_LOCKED_RUNTIME_PATH))
-
-
-def category27_to_legacy_code(info: Optional[Dict[str, object]]) -> Optional[int]:
-    """Map the 27-class display taxonomy to the 15-class input used by the locked 0.826 model."""
-    if not info:
-        return None
-    raw_parts = [
-        str(info.get(key, "")).strip()
-        for key in ("category27_code", "code", "category27_name", "name_en", "category27_label", "label")
-        if str(info.get(key, "")).strip()
-    ]
-    text = " ".join(raw_parts).lower()
-    code = str(info.get("category27_code") or info.get("code") or "").strip()
-    code_map = {
-        "A": 0,
-        "B": 1,
-        "C": 2,
-        "D": 3,
-        "E": 4,
-        "F": 5,
-        "G": 6,
-        "H": 7,
-        "I": 8,
-        "J": 9,
-        "K": 10,
-        "L": 10,
-        "M": 10,
-        "U": 11,
-        "V": 12,
-        "W": 12,
-        "X": 12,
-        "Z": 12,
-        "A2": 12,
-    }
-    if code in code_map:
-        return code_map[code]
-    if "phenol" in text:
-        return 13
-    if "alkane" in text:
-        return 0
-    if "diol" in text:
-        return 2
-    if "alcohol" in text or "polyol" in text:
-        return 1
-    if "ether" in text:
-        return 3
-    if "ketone" in text:
-        return 4
-    if "aldehyde" in text:
-        return 5
-    if "ester" in text:
-        return 6
-    if "dicarbox" in text:
-        return 8
-    if "carbox" in text:
-        return 7
-    if "halogen" in text or "chloro" in text or "bromo" in text or "fluoro" in text:
-        return 9
-    if "sulf" in text or "thiol" in text:
-        return 10
-    if "alkene" in text:
-        return 11
-    if "benzene" in text or "aromatic" in text or "pyridine" in text or "furan" in text or "imidazole" in text or "triazine" in text:
-        return 12
-    return 14
-
-
-def _build_v6_numeric_vector(dataset, ph_value: float, category27_info: Optional[Dict[str, object]]) -> np.ndarray:
-    """Build V6 numeric branch: [scaled_pH] + [category27 one-hot]."""
-    ph_arr = np.asarray([[float(ph_value)]], dtype=np.float32)
-    ph_scaled = dataset.ph_scaler.transform(ph_arr).reshape(-1).astype(np.float32)
-
-    cat_cols = list(getattr(dataset, "category_cols", []))
-    cat_vec = np.zeros((len(cat_cols),), dtype=np.float32)
-    legacy_code = None
-    info = category27_info or {}
-    for legacy_key in ("legacy_category_code", "category_code", "legacy_code"):
-        if legacy_key in info:
-            try:
-                legacy_code = int(float(info.get(legacy_key)))
-                break
-            except Exception:
-                legacy_code = None
-    if legacy_code is None:
-        legacy_code = category27_to_legacy_code(category27_info)
-    if legacy_code is not None:
-        legacy_candidates = [
-            f"cat_{legacy_code}",
-            f"cat_{float(legacy_code):.1f}",
-            f"cat_{legacy_category_name_en_from_code(int(legacy_code))}",
-        ]
-        for target_col in legacy_candidates:
-            if target_col in cat_cols:
-                cat_vec[cat_cols.index(target_col)] = 1.0
-                return np.concatenate([ph_scaled, cat_vec], axis=0).astype(np.float32)
-
-    candidates = []
-    for key in ("category27_label", "label", "category27_code", "code", "category27_name", "name_en", "name_cn"):
-        value = str(info.get(key, "")).strip()
-        if value:
-            candidates.append(value if value.startswith("cat_") else f"cat_{value}")
-    seen = set()
-    candidates = [c for c in candidates if not (c in seen or seen.add(c))]
-
-    matched = False
-    for target_col in candidates:
-        if target_col in cat_cols:
-            cat_vec[cat_cols.index(target_col)] = 1.0
-            matched = True
-            break
-    if not matched:
-        if "cat_Unknown" in cat_cols:
-            cat_vec[cat_cols.index("cat_Unknown")] = 1.0
-        elif cat_cols:
-            cat_vec[0] = 1.0
-    return np.concatenate([ph_scaled, cat_vec], axis=0).astype(np.float32)
 
 
 def _build_v9_numeric_vector(dataset, ph_value: float, category27_info: Optional[Dict[str, object]]) -> np.ndarray:
@@ -1130,66 +343,6 @@ def _build_v9_numeric_vector(dataset, ph_value: float, category27_info: Optional
             cat_vec[cat_cols.index(candidate)] = 1.0
             return np.concatenate([ph_scaled, cat_vec], axis=0).astype(np.float32)
     raise ValueError("The reaction class is not part of the locked 25-class DECAT taxonomy.")
-
-
-def _apply_v9_runtime_env(params: dict, payload_env: dict):
-    env_updates = {
-        "TRANSFORMER_V9_TRANSFORMER_CENTERED": "1",
-        "TRANSFORMER_V9_RESIDUAL_MAX": "0.85",
-        "TRANSFORMER_V9_RESIDUAL_MIN": "0.0",
-        "TRANSFORMER_V3_ENABLE_DUAL": "1",
-        "TRANSFORMER_V3_GATE_EXTRA_FEATURES": "1",
-        "TRANSFORMER_V3_ENABLE_CORRECTION_HEAD": "1",
-        "TRANSFORMER_V3_ENABLE_CHEM_ATTN_BIAS": "1" if bool(params.get("enable_chem_attn_bias", True)) else "0",
-        "TRANSFORMER_V3_ENABLE_FUSION": "1",
-        "TRANSFORMER_V3_CKPT_ENSEMBLE_WEIGHTED": "1" if bool(params.get("ckpt_ensemble_weighted", True)) else "0",
-        "TRANSFORMER_V3_CKPT_ENSEMBLE_TEMP": str(float(params.get("ckpt_ensemble_temp", 0.02))),
-        "TRANSFORMER_V7_ATTENTION_MIN_GATE": "0.10",
-        "TRANSFORMER_V7_ATTENTION_GATE_LOGIT_BIAS": "0.10",
-        "TRANSFORMER_V3_CHEM_ATTN_ALPHA": "0.42",
-    }
-    for key, value in payload_env.items():
-        if value is not None and str(value).strip() != "":
-            os.environ[str(key)] = str(value)
-    for key, value in env_updates.items():
-        os.environ[str(key)] = str(value)
-    os.environ["TRANSFORMER_V7_FIXED_SPLIT_JSON"] = str(V9_LOCKED_SPLIT_PATH)
-    os.environ["TRANSFORMER_V6_FIXED_SPLIT_JSON"] = str(V9_LOCKED_SPLIT_PATH)
-    os.environ["TRANSFORMER_V7_DATA_CSV"] = str(V9_LOCKED_DATASET_PATH)
-    os.environ["TRANSFORMER_V9_CATEGORY_EMBED_DIM"] = "0"
-    os.environ["TRANSFORMER_SEED"] = "242"
-    os.environ["TRANSFORMER_DETERMINISTIC"] = "1"
-
-
-def _extract_v9_payload_fields(payload: dict) -> Tuple[dict, dict, str]:
-    if "params" in payload:
-        params = dict(payload.get("params", {}) or {})
-    elif "best_result" in payload and isinstance(payload.get("best_result"), dict):
-        params = dict(payload.get("best_result", {}).get("params", {}) or {})
-    else:
-        params = dict(payload or {})
-    payload_env = dict(payload.get("env", {}) or {})
-    dataset_path = str(
-        payload.get("data_csv_path")
-        or payload.get("dataset")
-        or payload_env.get("TRANSFORMER_V7_DATA_CSV", "")
-        or payload_env.get("TRANSFORMER_V6_DATA_CSV", "")
-    ).strip()
-    return params, payload_env, dataset_path
-
-
-def _load_top_bit_indices(path: Path, fallback_idx: np.ndarray) -> np.ndarray:
-    if path.exists():
-        try:
-            values = []
-            for part in re.split(r"[,\s]+", path.read_text(encoding="utf-8-sig").strip()):
-                if str(part).strip():
-                    values.append(int(float(part)))
-            if values:
-                return np.asarray(values, dtype=int)
-        except Exception:
-            pass
-    return np.asarray(fallback_idx, dtype=int)
 
 
 def _tanimoto_dense_matrix(query_fp: np.ndarray, train_fps: np.ndarray) -> np.ndarray:
@@ -1214,8 +367,7 @@ def evaluate_ad_for_fingerprint(bundle: Dict[str, object], fp_dense: np.ndarray,
             "structural_AD_label": "Out of AD",
             "DECAT_AD_label": "Out of AD",
             "AD_reason": "fingerprint length is incompatible with the locked DECAT feature space",
-            "high_throughput_library_match": False,
-            "high_throughput_range_source": "Assessed online using the high-throughput prediction range rule",
+            "AD_source": "Assessed online against the training fingerprint space",
         }
     fp_selected = fp_arr[selected_idx] > 0.5
     sims = _tanimoto_dense_matrix(fp_selected.astype(np.uint8), train_fps)
@@ -1254,160 +406,8 @@ def evaluate_ad_for_fingerprint(bundle: Dict[str, object], fp_dense: np.ndarray,
             if np.isfinite(distance)
             else "nearest Tanimoto distance is unavailable"
         ),
-        "high_throughput_library_match": False,
-        "high_throughput_range_source": "Assessed online using the high-throughput prediction range rule",
+        "AD_source": "Assessed online against the training fingerprint space",
     }
-
-
-@st.cache_resource
-def load_legacy_decat_v9_bundle(model_path: str, params_path: str, dataset_path: str, summary_path: str = ""):
-    """Load the locked DECAT model and its validation-selected RF residual head."""
-    if not os.path.exists(model_path):
-        return None, None, "锁定 DECAT 模型文件不存在"
-    if not os.path.exists(params_path):
-        return None, None, "锁定 DECAT 参数文件不存在"
-    if not os.path.exists(dataset_path):
-        return None, None, "锁定 DECAT 参考数据集不存在"
-    if not V9_LOCKED_FUSION_COMPONENTS_PATH.exists():
-        return None, None, "锁定 DECAT 残差校正组件不存在"
-
-    try:
-        v9_mod = _get_v9_runtime_module()
-        params_payload = _load_json_file(params_path)
-        params, payload_env, payload_dataset = _extract_v9_payload_fields(params_payload)
-        if summary_path and os.path.exists(summary_path):
-            try:
-                summary_payload = _load_json_file(summary_path)
-                params = dict(summary_payload.get("best_result", {}).get("params", params) or params)
-                payload_env.update(dict(summary_payload.get("env", {}) or {}))
-            except Exception:
-                pass
-
-        _apply_v9_runtime_env(params, payload_env)
-        fp_bits = int(params.get("fp_bits", 3147))
-        topk_features = int(params.get("topk_features", params.get("topk", 1100)))
-        topk_features = max(1, min(topk_features, fp_bits))
-        fp_select = str(params.get("fp_select", params.get("fp_select_method", "rf"))).strip().lower() or "rf"
-
-        dataset = v9_mod.FingerprintReactionDataset(dataset_path, max_fp_bits=fp_bits, fingerprint_scale=False)
-        split_dict = v9_mod._build_split_indices(dataset)
-        train_idx = np.asarray(split_dict["train_idx"], dtype=int)
-        dataset.fit_scalers(train_idx)
-        rank_idx = v9_mod._get_fp_ranking(dataset, train_idx, fp_bits, fp_select)
-        selected_idx = np.asarray(rank_idx[:topk_features], dtype=int)
-
-        cfg = v9_mod.FingerprintConfig()
-        cfg.d_model = int(params.get("d_model", cfg.d_model))
-        cfg.dropout = float(params.get("dropout", cfg.dropout))
-        cfg.n_layers = int(params.get("n_layers", getattr(cfg, "n_layers", 2)))
-        cfg.n_heads = int(params.get("n_heads", getattr(cfg, "n_heads", 4)))
-        cfg.max_fp_tokens = int(params.get("max_fp_tokens", getattr(cfg, "max_fp_tokens", topk_features)))
-        cfg.norm_first = bool(params.get("norm_first", getattr(cfg, "norm_first", False)))
-        if cfg.n_heads <= 0:
-            cfg.n_heads = 4
-        if cfg.d_model % cfg.n_heads != 0:
-            cfg.d_model = max(cfg.n_heads, (cfg.d_model // cfg.n_heads) * cfg.n_heads)
-
-        numeric_dim = int(getattr(dataset, "num_dim", 1 + len(getattr(dataset, "category_cols", []))))
-        cfg.base_numeric_dim = int(getattr(dataset, "base_num_dim", numeric_dim))
-        class ContextualDualExpertRegressor(v9_mod.DualExpertRegressor):
-            def __init__(self, fingerprint_dim: int, numeric_dim: int, config):
-                super().__init__(fingerprint_dim, numeric_dim, config)
-                hidden = max(16, int(config.d_model // 4))
-                self.contextual_residual = nn.Sequential(
-                    nn.Linear(numeric_dim + 1, hidden),
-                    nn.GELU(),
-                    nn.Dropout(float(config.dropout)),
-                    nn.Linear(hidden, 1),
-                )
-
-            def forward_components(self, fingerprint: torch.Tensor, numeric: torch.Tensor):
-                components = super().forward_components(fingerprint, numeric)
-                context = torch.cat(
-                    [numeric.to(torch.float32), components["residual_gate"].unsqueeze(-1)], dim=1
-                )
-                adjustment = torch.tanh(self.contextual_residual(context)).squeeze(-1) * 0.15
-                components["correction"] = components["correction"] + adjustment
-                components["final"] = components["final"] + adjustment
-                return components
-
-        model = ContextualDualExpertRegressor(
-            fingerprint_dim=int(selected_idx.size),
-            numeric_dim=numeric_dim,
-            config=cfg,
-        ).to(DEVICE)
-        checkpoint = torch.load(model_path, map_location=DEVICE, weights_only=False)
-        state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
-        missing, unexpected = model.load_state_dict(state_dict, strict=True)
-        model.eval()
-
-        archive = np.load(V9_LOCKED_FUSION_COMPONENTS_PATH)
-        component_names = [str(value) for value in archive["component_names"].tolist()]
-        if "nn" not in component_names or "nn_plus_res_rf" not in component_names:
-            raise ValueError("锁定组件中缺少 nn_plus_res_rf 输出头")
-        nn_component = component_names.index("nn")
-        expected_feature_dim = int(selected_idx.size + numeric_dim)
-        x_train = np.asarray(archive["x_train"], dtype=np.float32)
-        y_train = np.asarray(archive["y_train"], dtype=np.float32).reshape(-1)
-        component_train = np.asarray(archive["component_train"], dtype=np.float32)
-        if x_train.shape != (train_idx.size, expected_feature_dim):
-            raise ValueError("锁定残差校正特征维度与当前模型不一致")
-        if component_train.shape[1] != train_idx.size:
-            raise ValueError("锁定残差校正训练样本数不一致")
-        residual_model = RandomForestRegressor(
-            n_estimators=280,
-            max_depth=12,
-            min_samples_leaf=2,
-            max_features=1.0,
-            random_state=90,
-            n_jobs=-1,
-        )
-        nn_train_raw = component_train[nn_component].reshape(-1)
-        residual_model.fit(
-            np.concatenate([x_train, nn_train_raw.reshape(-1, 1)], axis=1),
-            y_train - nn_train_raw,
-        )
-
-        train_fp_selected = np.asarray(dataset.fingerprint[train_idx][:, selected_idx] > 0.5, dtype=bool)
-        df_ref = read_csv_robust(dataset_path)
-        compound_col = next((c for c in ["chemical compound", "chemical_compound", "compound", "名称", "化学物质"] if c in df_ref.columns), None)
-        smiles_col = "SMILES" if "SMILES" in df_ref.columns else ("smiles" if "smiles" in df_ref.columns else None)
-        train_compounds = []
-        train_smiles = []
-        try:
-            if compound_col:
-                train_compounds = df_ref.iloc[train_idx][compound_col].astype(str).tolist()
-            if smiles_col:
-                train_smiles = df_ref.iloc[train_idx][smiles_col].astype(str).tolist()
-        except Exception:
-            train_compounds = []
-            train_smiles = []
-
-        bundle = {
-            "model": model,
-            "params": params,
-            "dataset": dataset,
-            "fp_bits": int(fp_bits),
-            "selected_idx": selected_idx,
-            "numeric_dim": int(numeric_dim),
-            "mode": "dual",
-            "missing_keys": list(missing),
-            "unexpected_keys": list(unexpected),
-            "payload_env": payload_env,
-            "category_cols": list(getattr(dataset, "category_cols", [])),
-            "residual_model": residual_model,
-            "residual_feature_dim": expected_feature_dim,
-            "train_idx": train_idx,
-            "train_fp_selected_bool": train_fp_selected,
-            "train_compounds": train_compounds,
-            "train_smiles": train_smiles,
-            "model_label": "DECAT locked model (nn_plus_res_rf)",
-            "test_r2": V9_LOCKED_TEST_R2,
-            "test_rmse": V9_LOCKED_TEST_RMSE,
-        }
-        return bundle, params, ""
-    except Exception as e:
-        return None, None, str(e)
 
 
 def _configure_paper_external_runtime(package: Path, config: dict) -> None:
@@ -1476,16 +476,15 @@ def _paper_top3_prediction(bundle: Dict[str, object], x: np.ndarray) -> np.ndarr
 
 @st.cache_resource
 def load_decat_v9_bundle(model_path: str, params_path: str, dataset_path: str, summary_path: str = ""):
-    """Load the exact Top-3 + serialized residual-RF inference route used in the paper."""
+    """Load the trained Top-3 ensemble and serialized residual RF."""
     required_paths = [
         PAPER_REBUILD_CONFIG_PATH,
         PAPER_TOP3_MANIFEST_PATH,
         PAPER_RESIDUAL_MANIFEST_PATH,
-        PAPER_FUSION_COMPONENTS_PATH,
     ]
     missing = [str(path) for path in required_paths if not path.exists()]
     if missing:
-        return None, None, f"Paper external-validation inference artifacts are missing: {missing}"
+        return None, None, f"Required inference artifacts are missing: {missing}"
 
     try:
         package = PAPER_REBUILD_PACKAGE
@@ -1494,7 +493,7 @@ def load_decat_v9_bundle(model_path: str, params_path: str, dataset_path: str, s
         states = list(ensemble.get("states", []))
         weights = np.asarray(ensemble.get("weights", []), dtype=np.float64)
         if len(states) != 3 or weights.shape != (3,) or not np.isclose(weights.sum(), 1.0):
-            raise ValueError("The paper inference manifest must contain three normalized checkpoint weights.")
+            raise ValueError("The inference manifest must contain three normalized checkpoint weights.")
 
         _configure_paper_external_runtime(package, config)
         runtime_path = package / "src" / "decat" / "transformer_v9_transformer_centered.py"
@@ -1519,7 +518,7 @@ def load_decat_v9_bundle(model_path: str, params_path: str, dataset_path: str, s
         for state in states:
             checkpoint_path = PAPER_REBUILD_ROOT / "top_checkpoints" / str(state["file"])
             if not checkpoint_path.exists():
-                raise FileNotFoundError(f"Paper checkpoint is missing: {checkpoint_path}")
+                raise FileNotFoundError(f"Model checkpoint is missing: {checkpoint_path}")
             model = _build_paper_contextual_model(
                 v9_mod, len(selected_idx), dataset.num_dim, model_config
             ).to(inference_device)
@@ -1534,15 +533,11 @@ def load_decat_v9_bundle(model_path: str, params_path: str, dataset_path: str, s
             with (PAPER_REBUILD_ROOT / "residual_rf" / str(filename)).open("rb") as handle:
                 residual_models.append(pickle.load(handle))
         if not residual_models:
-            raise ValueError("The paper inference bundle contains no serialized residual-RF model.")
+            raise ValueError("The inference bundle contains no serialized residual-RF model.")
 
-        fusion = np.load(PAPER_FUSION_COMPONENTS_PATH, allow_pickle=False)
-        component_names = [str(value) for value in fusion["component_names"].tolist()]
-        nn_index = component_names.index("nn")
-        residual_index = component_names.index("nn_plus_res_rf")
         train_fp_selected = np.asarray(dataset.fingerprint[train_idx][:, selected_idx] > 0.5, dtype=bool)
         df_ref = read_csv_robust(str(package / config["data"]["path"]))
-        compound_col = next((column for column in ["chemical compound", "chemical_compound", "compound", "名称", "化学物质"] if column in df_ref.columns), None)
+        compound_col = next((column for column in ["chemical compound", "chemical_compound", "compound"] if column in df_ref.columns), None)
         smiles_col = "SMILES" if "SMILES" in df_ref.columns else "smiles"
         bundle = {
             "models": models,
@@ -1560,20 +555,7 @@ def load_decat_v9_bundle(model_path: str, params_path: str, dataset_path: str, s
             "train_smiles": df_ref.iloc[train_idx][smiles_col].astype(str).tolist() if smiles_col else [],
             "params": dict(config["params"]),
             "model_label": "SEEN25-1626 Top-3 validation ensemble + serialized residual RF",
-            "test_r2": V9_LOCKED_TEST_R2,
-            "test_rmse": V9_LOCKED_TEST_RMSE,
         }
-        archived_x = np.asarray(fusion["x_test"], dtype=np.float32)
-        expected_nn = np.asarray(fusion["component_test"][nn_index], dtype=np.float32)
-        reconstructed_nn = _paper_top3_prediction(bundle, archived_x)
-        if float(np.max(np.abs(reconstructed_nn - expected_nn))) > 1e-5:
-            raise RuntimeError("Top-3 checkpoint ensemble does not reproduce the archived neural component.")
-        expected_final = np.asarray(fusion["component_test"][residual_index], dtype=np.float32)
-        correction = np.mean(
-            [model.predict(np.c_[archived_x, reconstructed_nn]) for model in residual_models], axis=0
-        )
-        if float(np.max(np.abs(reconstructed_nn + correction - expected_final))) > 1e-5:
-            raise RuntimeError("Serialized residual RF does not reproduce the archived nn_plus_res_rf component.")
         return bundle, dict(config["params"]), ""
     except Exception as error:
         return None, None, str(error)
@@ -1586,43 +568,29 @@ def predict_with_decat_v9(
     category27_info: Optional[Dict[str, object]],
     canonical_smiles: str = "",
 ):
-    """Single-sample inference with the paper's Top-3 nn_plus_res_rf route."""
+    """Predict one sample using the Top-3 ensemble and residual RF."""
     dataset = bundle["dataset"]
     selected_idx = np.asarray(bundle["selected_idx"], dtype=int).reshape(-1)
     fp_bits = int(bundle["fp_bits"])
 
     fp_dense = np.asarray(fp_dense, dtype=np.float32).reshape(-1)
     if fp_dense.size != fp_bits:
-        raise ValueError(f"指纹长度不匹配：模型需要 {fp_bits}，当前为 {fp_dense.size}")
+        raise ValueError(f"Fingerprint length mismatch: expected {fp_bits}, received {fp_dense.size}")
 
     fp_selected = fp_dense[selected_idx].astype(np.float32)
     num_vec = _build_v9_numeric_vector(dataset, ph_value=float(ph_value), category27_info=category27_info)
     if num_vec.size != int(bundle["numeric_dim"]):
-        raise ValueError(f"数值分支维度不匹配：模型需要 {bundle['numeric_dim']}，当前为 {num_vec.size}")
+        raise ValueError(f"Numeric input dimension mismatch: expected {bundle['numeric_dim']}, received {num_vec.size}")
 
     fusion_features = np.concatenate([fp_selected, num_vec], axis=0).astype(np.float32)
     if fusion_features.size != int(bundle["residual_feature_dim"]):
-        raise ValueError("残差校正特征维度与锁定模型不一致")
+        raise ValueError("Residual input dimension does not match the trained model")
     external_x = fusion_features.reshape(1, -1)
     pred_raw_nn = float(_paper_top3_prediction(bundle, external_x)[0])
     residual_input = np.c_[external_x, [pred_raw_nn]]
     residual = float(np.mean([model.predict(residual_input)[0] for model in bundle["residual_models"]]))
     pred_raw = pred_raw_nn + residual
     ad_detail = evaluate_ad_for_fingerprint(bundle, fp_dense, ph_value=ph_value)
-    library_ad_detail = lookup_high_throughput_range_record(canonical_smiles)
-    if library_ad_detail:
-        online_label = ad_detail.get("DECAT_AD_label", "Not assessed")
-        ad_detail.update(library_ad_detail)
-        ad_detail["online_DECAT_AD_label"] = online_label
-        try:
-            if float(ph_value) < PH_TRAIN_MIN or float(ph_value) > PH_TRAIN_MAX:
-                ad_detail["DECAT_AD_label"] = "Out of AD - pH outside train range"
-                ad_detail["AD_reason"] = (
-                    f"Matched in the screened high-throughput library, but pH={float(ph_value):.1f} "
-                    f"is outside the training range [{PH_TRAIN_MIN:.1f}, {PH_TRAIN_MAX:.1f}]."
-                )
-        except Exception:
-            pass
     detail = {
         "pred_scaled": None,
         "fp_bits": fp_bits,
@@ -1639,108 +607,6 @@ def predict_with_decat_v9(
     return pred_raw, detail
 
 
-def evaluate_ad_for_fingerprint_matrix(
-    bundle: Dict[str, object],
-    fp_matrix: np.ndarray,
-    ph_values: Optional[np.ndarray] = None,
-    chunk_size: int = 512,
-) -> pd.DataFrame:
-    """Vectorized nearest-neighbor Tanimoto AD screening for uploaded libraries."""
-    selected_idx = np.asarray(bundle["selected_idx"], dtype=int).reshape(-1)
-    train = np.asarray(bundle["train_fp_selected_bool"], dtype=np.uint8)
-    train_sums = train.sum(axis=1).astype(np.float32)
-    fps = np.asarray(fp_matrix, dtype=np.float32)
-    if fps.ndim == 1:
-        fps = fps.reshape(1, -1)
-    selected = (fps[:, selected_idx] > 0.5).astype(np.uint8)
-    n = int(selected.shape[0])
-    best_sim = np.zeros((n,), dtype=np.float32)
-    best_idx = np.full((n,), -1, dtype=int)
-
-    train_t = train.T.astype(np.uint8)
-    for start in range(0, n, int(chunk_size)):
-        end = min(n, start + int(chunk_size))
-        block = selected[start:end]
-        inter = block @ train_t
-        block_sums = block.sum(axis=1).astype(np.float32).reshape(-1, 1)
-        union = block_sums + train_sums.reshape(1, -1) - inter.astype(np.float32)
-        sims = np.divide(inter.astype(np.float32), union, out=np.zeros_like(union, dtype=np.float32), where=union > 0)
-        local_idx = np.argmax(sims, axis=1)
-        best_idx[start:end] = local_idx.astype(int)
-        best_sim[start:end] = sims[np.arange(end - start), local_idx].astype(np.float32)
-
-    distance = 1.0 - best_sim
-    structural_label = np.where(
-        distance <= AD_STRICT_DISTANCE_THRESHOLD,
-        "In AD",
-        np.where(distance <= AD_BORDERLINE_DISTANCE_THRESHOLD, "Borderline", "Out of AD"),
-    )
-    final_label = structural_label.astype(object)
-    if ph_values is not None:
-        ph_arr = pd.to_numeric(pd.Series(ph_values), errors="coerce").to_numpy(dtype=float)
-        outside = np.isfinite(ph_arr) & ((ph_arr < PH_TRAIN_MIN) | (ph_arr > PH_TRAIN_MAX))
-        final_label[outside] = "Out of AD - pH outside train range"
-
-    train_names = list(bundle.get("train_compounds", []))
-    train_smiles = list(bundle.get("train_smiles", []))
-    nearest_names = [
-        train_names[int(i)] if 0 <= int(i) < len(train_names) else ""
-        for i in best_idx
-    ]
-    nearest_smiles = [
-        train_smiles[int(i)] if 0 <= int(i) < len(train_smiles) else ""
-        for i in best_idx
-    ]
-    reasons = [
-        f"nearest Tanimoto distance={float(d):.4f}; strict<= {AD_STRICT_DISTANCE_THRESHOLD:.4f}, borderline<= {AD_BORDERLINE_DISTANCE_THRESHOLD:.4f}"
-        for d in distance
-    ]
-    return pd.DataFrame(
-        {
-            "nearest_train_similarity": best_sim.astype(float),
-            "nearest_train_distance": distance.astype(float),
-            "nearest_train_index": best_idx.astype(int),
-            "nearest_train_compound": nearest_names,
-            "nearest_train_SMILES": nearest_smiles,
-            "structural_AD_label": structural_label,
-            "DECAT_AD_label": final_label,
-            "AD_reason": reasons,
-        }
-    )
-
-
-def predict_batch_with_decat_v9(
-    bundle: Dict[str, object],
-    fp_matrix: np.ndarray,
-    ph_values: np.ndarray,
-    category_infos: List[Optional[Dict[str, object]]],
-    batch_size: int = 256,
-) -> np.ndarray:
-    """Batch neural inference with the locked DECAT V9 model."""
-    model = bundle["model"]
-    dataset = bundle["dataset"]
-    selected_idx = np.asarray(bundle["selected_idx"], dtype=int).reshape(-1)
-    fps = np.asarray(fp_matrix, dtype=np.float32)
-    if fps.ndim == 1:
-        fps = fps.reshape(1, -1)
-    fp_selected = fps[:, selected_idx].astype(np.float32)
-    numeric_rows = [
-        _build_v9_numeric_vector(dataset, ph_value=float(ph), category27_info=info)
-        for ph, info in zip(np.asarray(ph_values, dtype=float).reshape(-1), category_infos)
-    ]
-    numeric = np.vstack(numeric_rows).astype(np.float32)
-    preds_scaled = []
-    for start in range(0, fp_selected.shape[0], int(batch_size)):
-        end = min(fp_selected.shape[0], start + int(batch_size))
-        fp_tensor = torch.tensor(fp_selected[start:end], dtype=torch.float32, device=DEVICE)
-        num_tensor = torch.tensor(numeric[start:end], dtype=torch.float32, device=DEVICE)
-        with torch.no_grad():
-            pred = model(fp_tensor, num_tensor).detach().cpu().numpy().reshape(-1, 1)
-        preds_scaled.append(pred.astype(np.float32))
-    pred_scaled = np.vstack(preds_scaled)
-    return dataset.logk_scaler.inverse_transform(pred_scaled).reshape(-1).astype(float)
-
-
 def _canonicalize_smiles_text(smiles_text: object) -> Tuple[str, str]:
     text = "" if smiles_text is None else str(smiles_text).strip()
     if not text or text.lower() == "nan":
@@ -1752,390 +618,6 @@ def _canonicalize_smiles_text(smiles_text: object) -> Tuple[str, str]:
         return Chem.MolToSmiles(mol), "valid"
     except Exception:
         return "", "invalid"
-
-
-def _mol_scope_flags(canonical_smiles: str) -> Dict[str, object]:
-    if not canonical_smiles:
-        return {
-            "has_carbon": False,
-            "scope_ok_for_DECAT_organic_model": False,
-            "scope_reason": "missing_or_invalid_smiles",
-        }
-    mol = Chem.MolFromSmiles(canonical_smiles)
-    if mol is None:
-        return {
-            "has_carbon": False,
-            "scope_ok_for_DECAT_organic_model": False,
-            "scope_reason": "invalid_smiles",
-        }
-    atomic_nums = [atom.GetAtomicNum() for atom in mol.GetAtoms()]
-    has_carbon = 6 in atomic_nums
-    metal_like = any(num in {3, 4, 11, 12, 13, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 37, 38, 39, 40, 47, 48, 49, 50, 55, 56, 57, 78, 79, 80, 81, 82} for num in atomic_nums)
-    return {
-        "has_carbon": bool(has_carbon),
-        "scope_ok_for_DECAT_organic_model": bool(has_carbon and not metal_like),
-        "scope_reason": "ok" if has_carbon and not metal_like else ("non_carbon_or_inorganic" if not has_carbon else "metal_or_counterion"),
-    }
-
-
-def _read_uploaded_table(uploaded_file) -> Optional[pd.DataFrame]:
-    if uploaded_file is None:
-        return None
-    name = str(uploaded_file.name).lower()
-    try:
-        uploaded_file.seek(0)
-        if name.endswith((".xlsx", ".xls")):
-            return pd.read_excel(uploaded_file)
-        return pd.read_csv(uploaded_file, encoding="utf-8-sig", low_memory=False)
-    except Exception:
-        try:
-            uploaded_file.seek(0)
-            return pd.read_csv(uploaded_file, encoding="gb18030", low_memory=False)
-        except Exception as exc:
-            st.warning(f"Uploaded table could not be parsed: {exc}")
-            return None
-
-
-def _pick_column(df: pd.DataFrame, aliases: List[str]) -> Optional[str]:
-    normalized = {str(c).strip().lower().replace(" ", "").replace("_", ""): c for c in df.columns}
-    for alias in aliases:
-        key = str(alias).strip().lower().replace(" ", "").replace("_", "")
-        if key in normalized:
-            return normalized[key]
-    for c in df.columns:
-        c_low = str(c).strip().lower()
-        if any(str(alias).strip().lower() in c_low for alias in aliases):
-            return c
-    return None
-
-
-def _prepare_high_throughput_input(df: pd.DataFrame, default_ph: float) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray, List[Optional[Dict[str, object]]]]:
-    smiles_col = _pick_column(df, ["canonical_SMILES", "normalized_SMILES", "SMILES", "smiles", "raw_SMILES"])
-    if smiles_col is None:
-        raise ValueError("No SMILES column was found. Please include SMILES, normalized_SMILES, or canonical_SMILES.")
-    name_col = _pick_column(df, ["compound_name", "chemical compound", "compound", "name", "名称", "化学物质名称"])
-    cas_col = _pick_column(df, ["CAS", "CAS号", "cas"])
-    ph_col = _pick_column(df, ["pH", "source_pH", "ph"])
-
-    out = df.copy()
-    out["compound_name_for_screening"] = out[name_col].astype(str) if name_col else ""
-    out["CAS_for_screening"] = out[cas_col].astype(str) if cas_col else ""
-    cano = []
-    status = []
-    for val in out[smiles_col].tolist():
-        c, s = _canonicalize_smiles_text(val)
-        cano.append(c)
-        status.append(s)
-    out["canonical_SMILES"] = cano
-    out["smiles_status"] = status
-
-    scope_rows = [_mol_scope_flags(smi) for smi in out["canonical_SMILES"].tolist()]
-    for key in ["has_carbon", "scope_ok_for_DECAT_organic_model", "scope_reason"]:
-        out[key] = [row[key] for row in scope_rows]
-
-    ph_values = (
-        pd.to_numeric(out[ph_col], errors="coerce").to_numpy(dtype=float)
-        if ph_col
-        else np.full((len(out),), np.nan, dtype=float)
-    )
-    ph_for_prediction = np.where(np.isfinite(ph_values), ph_values, float(default_ph))
-    out["pH_for_prediction"] = ph_for_prediction
-
-    valid_mask = (out["smiles_status"] == "valid") & out["scope_ok_for_DECAT_organic_model"].astype(bool)
-    fps = []
-    valid_indices = []
-    category_infos = []
-    for idx, smi in enumerate(out["canonical_SMILES"].tolist()):
-        if not bool(valid_mask.iloc[idx]):
-            continue
-        fp = smiles_to_fingerprint(smi, fp_size=3147)
-        if fp is None:
-            out.loc[out.index[idx], "smiles_status"] = "invalid"
-            continue
-        info = classify_category27_from_smiles(smi, manual_input=None)
-        fps.append(fp)
-        valid_indices.append(idx)
-        category_infos.append(info)
-    fp_matrix = np.vstack(fps).astype(np.float32) if fps else np.zeros((0, 3147), dtype=np.float32)
-    return out, fp_matrix, np.asarray(valid_indices, dtype=int), category_infos
-
-
-@st.cache_data(ttl=3600)
-def load_builtin_high_throughput_results() -> Optional[pd.DataFrame]:
-    if HIGH_THROUGHPUT_COMBINED_UNIQUE_RESULTS.exists():
-        return read_csv_robust(str(HIGH_THROUGHPUT_COMBINED_UNIQUE_RESULTS))
-    return None
-
-
-def _clean_cell_text(value: object) -> str:
-    if value is None:
-        return ""
-    try:
-        if pd.isna(value):
-            return ""
-    except Exception:
-        pass
-    text = str(value).strip()
-    return "" if text.lower() in {"", "nan", "none", "null"} else text
-
-
-def _cell_to_bool(value: object) -> bool:
-    if isinstance(value, (bool, np.bool_)):
-        return bool(value)
-    try:
-        if pd.isna(value):
-            return False
-    except Exception:
-        pass
-    text = str(value).strip().lower()
-    if text in {"true", "1", "yes", "y"}:
-        return True
-    if text in {"false", "0", "no", "n", "", "nan", "none", "null"}:
-        return False
-    try:
-        return bool(float(text))
-    except Exception:
-        return False
-
-
-def _finite_float_or_nan(value: object) -> float:
-    try:
-        val = float(value)
-        return val if np.isfinite(val) else float("nan")
-    except Exception:
-        return float("nan")
-
-
-def lookup_high_throughput_range_record(canonical_smiles: str) -> Optional[Dict[str, object]]:
-    """Return prior high-throughput screening status if the compound is already in the screened library."""
-    if not canonical_smiles:
-        return None
-    df = load_builtin_high_throughput_results()
-    if df is None or df.empty or "canonical_SMILES" not in df.columns:
-        return None
-    target = str(canonical_smiles).strip()
-    hit = df[df["canonical_SMILES"].astype(str).str.strip() == target]
-    if hit.empty:
-        return None
-    row = hit.iloc[0].to_dict()
-    # The release result is the seed-242 re-screen.  Do not fall back to the
-    # legacy V9 label because its thresholds and selected-bit space differ.
-    ad_label = _clean_cell_text(row.get("seed242_AD_label"))
-    source_bits = []
-    if _cell_to_bool(row.get("has_previous_high_throughput_source", False)):
-        source_bits.append("previous pollutant library")
-    if _cell_to_bool(row.get("has_ACS_EST2026_source", False)):
-        source_bits.append("ACS EST external library")
-    source_text = "; ".join(source_bits) if source_bits else "screened high-throughput library"
-    seed_distance = _finite_float_or_nan(row.get("seed242_nearest_train_distance", np.nan))
-    if not _cell_to_bool(row.get("scope_ok_for_DECAT_organic_model", True)):
-        seed_structural_label = "Out of DECAT scope - inorganic/no carbon"
-    elif not np.isfinite(seed_distance):
-        seed_structural_label = "Not evaluated"
-    elif seed_distance <= AD_STRICT_DISTANCE_THRESHOLD:
-        seed_structural_label = "In AD"
-    elif seed_distance <= AD_BORDERLINE_DISTANCE_THRESHOLD:
-        seed_structural_label = "Borderline"
-    else:
-        seed_structural_label = "Out of AD"
-    if np.isfinite(seed_distance):
-        seed_reason = (
-            f"seed-242 nearest Tanimoto distance={seed_distance:.4f}; "
-            f"strict<= {AD_STRICT_DISTANCE_THRESHOLD:.4f}, "
-            f"borderline<= {AD_BORDERLINE_DISTANCE_THRESHOLD:.4f}"
-        )
-    else:
-        seed_reason = "seed-242 nearest Tanimoto distance is unavailable"
-    return {
-        "high_throughput_library_match": True,
-        "high_throughput_range_source": f"Matched in the {source_text}",
-        "high_throughput_representative_name": _clean_cell_text(row.get("representative_name", "")),
-        "high_throughput_representative_CAS": _clean_cell_text(row.get("representative_CAS", "")),
-        "high_throughput_n_source_rows": row.get("n_source_rows", np.nan),
-        "DECAT_AD_label": ad_label,
-        "structural_AD_label": seed_structural_label,
-        "nearest_train_similarity": _finite_float_or_nan(
-            row.get("seed242_nearest_train_similarity", np.nan)
-        ),
-        "nearest_train_distance": _finite_float_or_nan(
-            row.get("seed242_nearest_train_distance", np.nan)
-        ),
-        "nearest_train_index": row.get("nearest_train_index", -1),
-        "nearest_train_compound": _clean_cell_text(row.get("nearest_train_compound", "")),
-        "nearest_train_SMILES": _clean_cell_text(row.get("nearest_train_SMILES", "")),
-        "AD_reason": seed_reason,
-    }
-
-
-@st.cache_resource
-def load_transformer_v6_bundle(model_path: str, params_path: str, dataset_path: str):
-    """加载 V6 checkpoint、参数与训练期预处理状态。"""
-    if not os.path.exists(model_path):
-        return None, None, "V6模型文件不存在"
-    if not os.path.exists(params_path):
-        return None, None, "V6参数文件不存在"
-    if not os.path.exists(dataset_path):
-        return None, None, "V6参考数据集不存在（用于还原缩放器与特征筛选）"
-
-    try:
-        v6_mod = _get_v6_runtime_module()
-        payload = _load_json_file(params_path)
-        params, payload_env, _ = _extract_v6_payload_fields(payload)
-        _apply_v6_runtime_env(params, payload_env)
-
-        fp_bits = int(params.get("fp_bits", 3147))
-        topk_features = int(params.get("topk_features", params.get("topk", fp_bits)))
-        topk_features = max(1, min(topk_features, fp_bits))
-        fp_select = str(params.get("fp_select", params.get("fp_select_method", "rf"))).strip().lower() or "rf"
-
-        dataset = v6_mod.FingerprintReactionDataset(dataset_path, max_fp_bits=fp_bits, fingerprint_scale=False)
-        split_dict = v6_mod._build_split_indices(dataset)
-        train_idx = np.asarray(split_dict["train_idx"], dtype=int)
-        dataset.fit_scalers(train_idx)
-        rank_idx = v6_mod._get_fp_ranking(dataset, train_idx, fp_bits, fp_select)
-        selected_idx = np.asarray(rank_idx[:topk_features], dtype=int)
-
-        cfg = v6_mod.FingerprintConfig()
-        cfg.d_model = int(params.get("d_model", cfg.d_model))
-        cfg.dropout = float(params.get("dropout", cfg.dropout))
-        cfg.n_layers = int(params.get("n_layers", getattr(cfg, "n_layers", 2)))
-        cfg.n_heads = int(params.get("n_heads", getattr(cfg, "n_heads", 4)))
-        cfg.max_fp_tokens = int(params.get("max_fp_tokens", getattr(cfg, "max_fp_tokens", topk_features)))
-        cfg.norm_first = bool(params.get("norm_first", getattr(cfg, "norm_first", False)))
-
-        if cfg.n_heads <= 0:
-            cfg.n_heads = 4
-        if cfg.d_model % cfg.n_heads != 0:
-            cfg.d_model = max(cfg.n_heads, (cfg.d_model // cfg.n_heads) * cfg.n_heads)
-
-        numeric_dim = int(getattr(dataset, "num_dim", 1 + len(getattr(dataset, "category_cols", []))))
-        mode = _normalize_v6_mode(params.get("model_mode", "dual"))
-        if mode == "dual":
-            model = v6_mod.DualExpertRegressor(
-                fingerprint_dim=int(topk_features),
-                numeric_dim=numeric_dim,
-                config=cfg,
-            ).to(DEVICE)
-        elif mode == "attn":
-            model = v6_mod._build_attention_expert(
-                fingerprint_dim=int(topk_features),
-                numeric_dim=numeric_dim,
-                config=cfg,
-            ).to(DEVICE)
-        else:
-            model = v6_mod.FingerprintTransformer(
-                fingerprint_dim=int(topk_features),
-                numeric_dim=numeric_dim,
-                config=cfg,
-            ).to(DEVICE)
-
-        checkpoint = torch.load(model_path, map_location=DEVICE, weights_only=False)
-        state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        model.eval()
-
-        bundle = {
-            "model": model,
-            "params": params,
-            "dataset": dataset,
-            "fp_bits": int(fp_bits),
-            "selected_idx": selected_idx,
-            "numeric_dim": int(numeric_dim),
-            "mode": mode,
-            "missing_keys": list(missing),
-            "unexpected_keys": list(unexpected),
-            "payload_env": payload_env,
-            "category_cols": list(getattr(dataset, "category_cols", [])),
-        }
-        return bundle, params, ""
-    except Exception as e:
-        return None, None, str(e)
-
-
-def predict_with_transformer_v6(bundle: Dict[str, object], fp_dense: np.ndarray, ph_value: float, category27_info: Optional[Dict[str, object]]):
-    """单样本 V6 推理，并自动反标准化回原始 logk。"""
-    model = bundle["model"]
-    params = bundle["params"]
-    dataset = bundle["dataset"]
-    fp_bits = int(bundle["fp_bits"])
-    selected_idx = np.asarray(bundle["selected_idx"], dtype=int).reshape(-1)
-
-    fp_dense = np.asarray(fp_dense, dtype=np.float32).reshape(-1)
-    if fp_dense.size != fp_bits:
-        raise ValueError(f"指纹长度不匹配：模型需要 {fp_bits}，当前为 {fp_dense.size}")
-
-    fp_selected = fp_dense[selected_idx].astype(np.float32)
-    num_vec = _build_v6_numeric_vector(dataset, ph_value=float(ph_value), category27_info=category27_info)
-    if num_vec.size != int(bundle["numeric_dim"]):
-        raise ValueError(f"数值分支维度不匹配：模型需要 {bundle['numeric_dim']}，当前为 {num_vec.size}")
-
-    fp_tensor = torch.tensor(fp_selected.reshape(1, -1), dtype=torch.float32, device=DEVICE)
-    num_tensor = torch.tensor(num_vec.reshape(1, -1), dtype=torch.float32, device=DEVICE)
-
-    with torch.no_grad():
-        pred_scaled = model(fp_tensor, num_tensor)
-        pred_scaled_val = float(pred_scaled.detach().cpu().numpy().reshape(-1)[0])
-
-    pred_raw = float(dataset.logk_scaler.inverse_transform(np.array([[pred_scaled_val]], dtype=np.float32)).reshape(-1)[0])
-    detail = {
-        "pred_scaled": pred_scaled_val,
-        "fp_bits": fp_bits,
-        "topk_features": int(selected_idx.size),
-        "max_fp_tokens": int(params.get("max_fp_tokens", 0)),
-        "n_heads": int(params.get("n_heads", 0)),
-        "n_layers": int(params.get("n_layers", 0)),
-        "mode": str(bundle.get("mode", "dual")),
-    }
-    return pred_raw, detail
-
-
-def normalize_family12_input(category_input):
-    """将用户输入的类别文本映射到 family12 标准。"""
-    if pd.isna(category_input):
-        return None
-    text = str(category_input).strip()
-    if text == "":
-        return None
-    if text in FAMILY12_CODE_TO_INFO:
-        return FAMILY12_CODE_TO_INFO[text]
-
-    low = text.lower()
-    if low in FAMILY12_ALIAS_TO_CODE:
-        return FAMILY12_CODE_TO_INFO[FAMILY12_ALIAS_TO_CODE[low]]
-
-    for alias, code in FAMILY12_ALIAS_TO_CODE.items():
-        if alias and (alias in low or alias in text):
-            return FAMILY12_CODE_TO_INFO[code]
-    for item in FAMILY12_CLASSES:
-        if low == item["name_en"].lower() or text == item["name_cn"]:
-            return item
-    return None
-
-
-def classify_family12_from_smiles(smiles: Optional[str], manual_input: Optional[str] = None):
-    """优先用 SMILES 按 family12 自动分类；无法分类时回退到手工输入。"""
-    if smiles and str(smiles).strip():
-        try:
-            family12_mod = _get_family12_runtime_module()
-            features = family12_mod.parse_features(str(smiles).strip())
-            code, name_en, reason = family12_mod.classify_family12(features)
-            info = dict(FAMILY12_EN_TO_INFO.get(name_en, FAMILY12_CODE_TO_INFO.get(code, {})))
-            if info:
-                info["reason_raw"] = reason
-                info["reason_cn"] = FAMILY12_REASON_CN_MAP.get(reason, reason)
-                info["source"] = "smiles_rule"
-                return info
-        except Exception:
-            pass
-
-    manual_info = normalize_family12_input(manual_input)
-    if manual_info:
-        info = dict(manual_info)
-        info["reason_raw"] = "manual_input_match"
-        info["reason_cn"] = "未获得可用 SMILES，已根据输入的类别文本映射到 family12 标准。"
-        info["source"] = "manual_input"
-        return info
-    return None
 
 
 def normalize_category27_input(category_input):
@@ -2180,8 +662,8 @@ def locked_category_info(category_label: Optional[str], reason: str = "", source
 
 
 @st.cache_data(show_spinner=False)
-def load_external_validation_category_lookup(path: str) -> Dict[str, str]:
-    """Load only archived class labels needed to reproduce published external cases."""
+def load_category_overrides(path: str) -> Dict[str, str]:
+    """Load molecule-specific class assignments used by the predictor."""
     if not path or not os.path.exists(path):
         return {}
     frame = read_csv_robust(path)
@@ -2278,410 +760,22 @@ def classify_category27_from_smiles(smiles: Optional[str], manual_input: Optiona
     if mol is None:
         return None
     canonical = Chem.MolToSmiles(mol, isomericSmiles=True)
-    published_label = load_external_validation_category_lookup(str(PAPER_EXTERNAL_CASES_PATH)).get(canonical)
-    if published_label:
+    override_label = load_category_overrides(str(CATEGORY_OVERRIDES_PATH)).get(canonical)
+    if override_label:
         return locked_category_info(
-            published_label,
-            "Archived paper external-validation class assignment.",
-            "paper_external_manifest",
+            override_label,
+            "Molecule-specific class assignment from the inference category map.",
+            "category_override",
         )
     code, reason = _classify_locked_category_from_mol(mol)
     return locked_category_info(code, reason, "locked_smiles_rule")
 
 
-def _get_v4_runtime_modules():
-    """Load legacy transformer base classes + V4 innovation module for inference."""
-    base_candidates = [
-        PROJECT_DIR / "trans优化.py",
-        PROJECT_DIR / "原版transformer.py",
-    ]
-    v4_script_path = PROJECT_DIR / "transformer_v4.py"
-    if not v4_script_path.exists():
-        raise FileNotFoundError(f"缺少V4脚本：{v4_script_path}")
-
-    base_module = None
-    last_err = None
-    for cand in base_candidates:
-        if not cand.exists():
-            continue
-        try:
-            mod = _load_module_from_file("_streamlit_transformer_base", str(cand))
-            required = [
-                "AttentionFingerprintTransformer",
-                "FingerprintConfig",
-                "FingerprintReactionDataset",
-                "FingerprintTrainer",
-                "FingerprintTransformer",
-                "SelectedFeatureSubset",
-            ]
-            if all(hasattr(mod, x) for x in required):
-                base_module = mod
-                break
-            last_err = RuntimeError(f"{cand} 缺少V4依赖类")
-        except Exception as e:
-            last_err = e
-            continue
-    if base_module is None:
-        raise RuntimeError(f"无法加载V4基础模块：{last_err}")
-
-    # 1) 先载入基础类，并注册为 `transformer`，供 transformer_v4.py 的 `import transformer` 使用
-    sys.modules["transformer"] = base_module
-
-    # 2) 再载入 V4 脚本（此时其依赖将落到上面的 base_module）
-    v4_module = _load_module_from_file("_streamlit_transformer_v4", str(v4_script_path))
-    return base_module, v4_module
-
-
-def _build_v4_numeric_vector(dataset, ph_value: float, category_code: int) -> np.ndarray:
-    """Build numeric branch: [scaled_pH] + [one-hot category]."""
-    ph_arr = np.asarray([[float(ph_value)]], dtype=np.float32)
-    ph_scaled = dataset.ph_scaler.transform(ph_arr).reshape(-1).astype(np.float32)
-
-    cat_cols = list(getattr(dataset, "category_cols", []))
-    cat_vec = np.zeros((len(cat_cols),), dtype=np.float32)
-    target_col = f"cat_{int(category_code)}"
-    if target_col in cat_cols:
-        cat_vec[cat_cols.index(target_col)] = 1.0
-    elif "cat_Unknown" in cat_cols:
-        cat_vec[cat_cols.index("cat_Unknown")] = 1.0
-
-    return np.concatenate([ph_scaled, cat_vec], axis=0).astype(np.float32)
-
-
-@st.cache_resource
-def load_transformer_v4_bundle(model_path: str, params_path: str, dataset_path: str):
-    """Load Transformer V4 checkpoint + params + preprocessing state for robust inference."""
-    if not os.path.exists(model_path):
-        return None, None, "V4模型文件不存在"
-    if not os.path.exists(params_path):
-        return None, None, "V4参数文件不存在"
-    if not os.path.exists(dataset_path):
-        return None, None, "V4参考数据集不存在（用于还原缩放与特征选择）"
-
-    try:
-        base_mod, v4_mod = _get_v4_runtime_modules()
-
-        with open(params_path, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-        params = payload.get("params", payload)
-
-        fp_bits = int(params.get("fp_bits", 4096))
-        topk_features = int(params.get("topk_features", params.get("topk", fp_bits)))
-        topk_features = max(1, min(topk_features, fp_bits))
-        fp_select = str(params.get("fp_select", "rf")).strip().lower() or "rf"
-
-        # 与训练一致：先构建数据集（含 pH/logk scaler），再按固定 split + RF 取 Top-K 特征
-        dataset = base_mod.FingerprintReactionDataset(dataset_path, max_fp_bits=fp_bits, fingerprint_scale=False)
-        split_dict = v4_mod._build_split_indices(dataset)
-        train_idx = np.asarray(split_dict["train_idx"], dtype=int)
-        rank_idx = v4_mod._get_fp_ranking(dataset, train_idx, fp_bits, fp_select)
-        selected_idx = np.asarray(rank_idx[:topk_features], dtype=int)
-
-        cfg = base_mod.FingerprintConfig()
-        cfg.d_model = int(params.get("d_model", cfg.d_model))
-        cfg.dropout = float(params.get("dropout", cfg.dropout))
-        cfg.n_layers = int(params.get("n_layers", getattr(cfg, "n_layers", 1)))
-        cfg.n_heads = int(params.get("n_heads", getattr(cfg, "n_heads", 4)))
-        cfg.max_fp_tokens = int(params.get("max_fp_tokens", getattr(cfg, "max_fp_tokens", topk_features)))
-
-        if cfg.n_heads <= 0:
-            cfg.n_heads = 4
-        if cfg.d_model % cfg.n_heads != 0:
-            cfg.d_model = max(cfg.n_heads, (cfg.d_model // cfg.n_heads) * cfg.n_heads)
-
-        numeric_dim = int(getattr(dataset, "num_dim", 1 + len(getattr(dataset, "category_cols", []))))
-        mode_raw = str(params.get("model_mode", "dual")).strip().lower()
-        mode = mode_raw.split("+", 1)[0] if "+" in mode_raw else mode_raw
-        if mode not in {"dual", "attn", "mlp"}:
-            mode = "dual"
-
-        if mode == "dual":
-            model = v4_mod.DualExpertRegressor(fingerprint_dim=int(topk_features), numeric_dim=numeric_dim, config=cfg).to(DEVICE)
-        elif mode == "attn":
-            model = v4_mod._build_attention_expert(
-                fingerprint_dim=int(topk_features),
-                numeric_dim=numeric_dim,
-                config=cfg,
-            ).to(DEVICE)
-        else:
-            model = base_mod.FingerprintTransformer(
-                fingerprint_dim=int(topk_features),
-                numeric_dim=numeric_dim,
-                config=cfg,
-            ).to(DEVICE)
-
-        checkpoint = torch.load(model_path, map_location=DEVICE, weights_only=False)
-        state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        model.eval()
-
-        bundle = {
-            "model": model,
-            "params": params,
-            "dataset": dataset,
-            "fp_bits": int(fp_bits),
-            "selected_idx": selected_idx,
-            "numeric_dim": int(numeric_dim),
-            "mode": mode,
-            "missing_keys": list(missing),
-            "unexpected_keys": list(unexpected),
-        }
-        return bundle, params, ""
-    except Exception as e:
-        return None, None, str(e)
-
-def load_dynamic_ann_model(model_path, input_dim, hidden_layer_sizes, dropout_rate):
-    """加载动态配置的ANN模型"""
-    try:
-        # 加载模型权重，兼容两种保存方式：仅state_dict或全字典
-        checkpoint = torch.load(model_path, map_location=DEVICE, weights_only=False)
-        if isinstance(checkpoint, dict):
-            state_dict = checkpoint.get("model_state_dict", checkpoint)
-        else:
-            state_dict = checkpoint
-
-        resolved_input_dim, resolved_hidden_layer_sizes, resolved_dropout = _infer_architecture_from_checkpoint(
-            checkpoint=checkpoint,
-            default_input_dim=input_dim,
-            default_hidden_layer_sizes=hidden_layer_sizes,
-            default_dropout=dropout_rate,
-        )
-        if resolved_hidden_layer_sizes != list(hidden_layer_sizes) or abs(resolved_dropout - float(dropout_rate)) > 1e-12:
-            st.info(
-                f"Architecture metadata was detected in the checkpoint and applied automatically: "
-                f"hidden={resolved_hidden_layer_sizes}, dropout={resolved_dropout:.3f}"
-            )
-        if resolved_input_dim != int(input_dim):
-            st.info(
-                f"The checkpoint expects input dimension {resolved_input_dim} rather than the current concatenated dimension {input_dim}. "
-                f"Features will be aligned automatically."
-            )
-
-        model = DynamicANNRegressor(
-            input_dim=resolved_input_dim,
-            hidden_layer_sizes=resolved_hidden_layer_sizes,
-            dropout_rate=resolved_dropout,
-        ).to(DEVICE)
-
-        state_dict = _remap_legacy_state_dict_to_dynamic(state_dict, resolved_hidden_layer_sizes)
-        model.load_state_dict(state_dict)
-        model.eval()  # 切换到评估模式
-
-        feature_names = None
-        y_scaler_mean = None
-        y_scaler_scale = None
-        fp_size_ckpt = FP_SIZE
-        if isinstance(checkpoint, dict):
-            feat = checkpoint.get("feature_names")
-            if isinstance(feat, (list, tuple)) and len(feat) > 0:
-                feature_names = [str(x) for x in feat]
-            if "y_scaler_mean_" in checkpoint and "y_scaler_scale_" in checkpoint:
-                try:
-                    y_scaler_mean = float(np.asarray(checkpoint["y_scaler_mean_"]).reshape(-1)[0])
-                    y_scaler_scale = float(np.asarray(checkpoint["y_scaler_scale_"]).reshape(-1)[0])
-                except Exception:
-                    y_scaler_mean = None
-                    y_scaler_scale = None
-            if (y_scaler_mean is None or y_scaler_scale is None) and checkpoint.get("y_scaler") is not None:
-                try:
-                    scaler_obj = checkpoint.get("y_scaler")
-                    y_scaler_mean = float(np.asarray(getattr(scaler_obj, "mean_", None)).reshape(-1)[0])
-                    y_scaler_scale = float(np.asarray(getattr(scaler_obj, "scale_", None)).reshape(-1)[0])
-                except Exception:
-                    y_scaler_mean = None
-                    y_scaler_scale = None
-            try:
-                fp_size_ckpt = int(checkpoint.get("fp_size", FP_SIZE))
-            except Exception:
-                fp_size_ckpt = FP_SIZE
-            if fp_size_ckpt == FP_SIZE and feature_names:
-                fp_name_count = len([name for name in feature_names if str(name).lower().startswith("fp_")])
-                if fp_name_count > 0:
-                    fp_size_ckpt = int(fp_name_count)
-
-        model.expected_input_dim = int(resolved_input_dim)
-        model.feature_names = feature_names
-        model.y_scaler_mean = y_scaler_mean
-        model.y_scaler_scale = y_scaler_scale
-        model.fp_size_ckpt = fp_size_ckpt
-        return model
-    except Exception as e:
-        st.error(f"Model loading failed: {str(e)}")
-        st.info("Please confirm that the checkpoint path is correct, the file is readable, and the checkpoint is not corrupted.")
-        return None
-
-
-def predict_with_transformer_v4(bundle: Dict[str, object], fp_dense: np.ndarray, ph_value: float, category_code: int):
-    """Run single-sample V4 inference and inverse-transform to raw logk."""
-    model = bundle["model"]
-    params = bundle["params"]
-    dataset = bundle["dataset"]
-    fp_bits = int(bundle["fp_bits"])
-    selected_idx = np.asarray(bundle["selected_idx"], dtype=int).reshape(-1)
-
-    fp_dense = np.asarray(fp_dense, dtype=np.float32).reshape(-1)
-    if fp_dense.size != fp_bits:
-        raise ValueError(f"指纹长度不匹配：模型需要 {fp_bits}，当前为 {fp_dense.size}")
-
-    fp_selected = fp_dense[selected_idx].astype(np.float32)
-    num_vec = _build_v4_numeric_vector(dataset, ph_value=float(ph_value), category_code=int(category_code))
-    if num_vec.size != int(bundle["numeric_dim"]):
-        raise ValueError(f"数值分支维度不匹配：模型需要 {bundle['numeric_dim']}，当前为 {num_vec.size}")
-
-    fp_tensor = torch.tensor(fp_selected.reshape(1, -1), dtype=torch.float32, device=DEVICE)
-    num_tensor = torch.tensor(num_vec.reshape(1, -1), dtype=torch.float32, device=DEVICE)
-
-    with torch.no_grad():
-        pred_scaled = model(fp_tensor, num_tensor)
-        pred_scaled_val = float(pred_scaled.detach().cpu().numpy().reshape(-1)[0])
-
-    pred_raw = float(dataset.logk_scaler.inverse_transform(np.array([[pred_scaled_val]], dtype=np.float32)).reshape(-1)[0])
-    detail = {
-        "pred_scaled": pred_scaled_val,
-        "fp_bits": fp_bits,
-        "topk_features": int(selected_idx.size),
-        "max_fp_tokens": int(params.get("max_fp_tokens", 0)),
-        "n_heads": int(params.get("n_heads", 0)),
-        "n_layers": int(params.get("n_layers", 0)),
-    }
-    return pred_raw, detail
-
-
-def build_model_input_vector(fp, ph_value, category_code, model):
-    """Build feature vector in model training order (supports Top-K feature_names)."""
-    fp = np.asarray(fp, dtype=np.float32).reshape(-1)
-    feature_names = getattr(model, "feature_names", None)
-    expected_dim = int(getattr(model, "expected_input_dim", fp.size + 2))
-
-    if not feature_names:
-        full = np.concatenate([fp, np.array([ph_value, category_code], dtype=np.float32)], axis=0)
-        if full.size != expected_dim:
-            raise ValueError(
-                f"模型期望输入维度={expected_dim}，但当前构造维度={full.size}。"
-                "该模型可能使用了特征筛选，请使用包含 feature_names 的模型文件。"
-            )
-        return full, []
-
-    value_by_name = {
-        "pH": float(ph_value),
-        "pH_processed": float(ph_value),
-        "category": float(category_code),
-    }
-
-    selected = []
-    missing = []
-    for name in feature_names:
-        if name in value_by_name:
-            selected.append(value_by_name[name])
-            continue
-        if name.startswith("fp_"):
-            try:
-                idx = int(name.split("_", 1)[1])
-                selected.append(float(fp[idx]) if 0 <= idx < fp.size else 0.0)
-                if not (0 <= idx < fp.size):
-                    missing.append(name)
-            except Exception:
-                selected.append(0.0)
-                missing.append(name)
-            continue
-        selected.append(0.0)
-        missing.append(name)
-
-    x = np.asarray(selected, dtype=np.float32)
-    if x.size != expected_dim:
-        raise ValueError(f"按 feature_names 构造后维度={x.size}，与模型期望维度={expected_dim}不一致。")
-    return x, missing
-
-
-@st.cache_data(ttl=1800)
-def load_local_dataset(uploaded_file):
-    """加载本地CSV数据集，兼容不同编码"""
-    if uploaded_file is None:
-        return None
-    encodings_order = ["utf-8", "utf-8-sig", "gb18030", "gbk", "cp936", "latin1"]
-    for enc in encodings_order:
-        try:
-            uploaded_file.seek(0)
-            return pd.read_csv(uploaded_file, encoding=enc, low_memory=False)
-        except Exception:
-            continue
-    st.warning("Dataset parsing failed: the file encoding or CSV format is not supported.")
-    return None
-
-
-def parse_fingerprint_string(fp_str, expected_len: Optional[int] = None):
-    """将字符串形式的指纹转换为numpy数组"""
-    if not isinstance(fp_str, str) or fp_str.strip() == "":
-        return None
-    parts = [p for p in re.split(r"[,\s]+", fp_str.strip()) if p]
-    if expected_len is not None and len(parts) != int(expected_len):
-        return None
-    try:
-        return np.array([float(p) for p in parts], dtype=np.float32)
-    except Exception:
-        return None
-
-
-def find_compound_in_dataset(chemical_name, df):
-    """在本地数据集中查找化学物质，命中则返回信息"""
-    if df is None or df.empty or not chemical_name:
-        return None
-    target = chemical_name.strip().lower()
-    name_cols = ["化学物质名称", "名称", "name", "Name", "中文名称", "英文名称"]
-    cas_cols = ["CAS号", "CAS", "cas"]
-    smiles_cols = ["SMILES", "smiles"]
-    fp_cols = ["分子指纹", "fingerprint", "Fingerprint", "fp"]
-    cat_cols = ["类别编码", "category_code", "category", "类别"]
-    row = None
-    for col in name_cols:
-        if col in df.columns:
-            hit = df[df[col].astype(str).str.strip().str.lower() == target]
-            if not hit.empty:
-                row = hit.iloc[0]
-                break
-    if row is None:
-        return None
-    def pick_first(cols):
-        for c in cols:
-            if c in df.columns and pd.notna(row[c]):
-                return row[c]
-        return None
-    cas = pick_first(cas_cols)
-    smiles = pick_first(smiles_cols)
-    fp_raw = pick_first(fp_cols)
-    fp = parse_fingerprint_string(fp_raw) if fp_raw is not None else None
-    cat = pick_first(cat_cols)
-    try:
-        cat_code = int(cat)
-    except Exception:
-        cat_code = None
-    category27_info = None
-    category27_code = pick_first(["category27_code", "new_category_code", "family12_category_code"])
-    category27_name = pick_first(["category27_name", "new_category_name", "family12_category_name"])
-    category27_label = pick_first(["category27_label"])
-    category27_reason = pick_first(["category27_reason"])
-    for item in [category27_label, category27_code, category27_name]:
-        category27_info = normalize_category27_input(item)
-        if category27_info:
-            category27_info = dict(category27_info)
-            category27_info["source"] = "uploaded_dataset"
-            category27_info["category27_reason"] = str(category27_reason) if category27_reason is not None else "Loaded from the uploaded dataset."
-            category27_info["label"] = category27_info.get("category27_label")
-            break
-    return {
-        "cas": cas,
-        "smiles": smiles,
-        "fingerprint": fp,
-        "category_code": cat_code,
-        "category27_info": category27_info,
-    }
-
-
 @st.cache_data(ttl=3600)
 def load_reference_dataset(dataset_path: Optional[str] = None):
-    """加载本地参考数据集，仅保留核心列。"""
+    """Load the reference dataset columns used by the prediction form."""
     try:
-        ref_path = dataset_path or DATASET_PATH
+        ref_path = dataset_path or str(RUNTIME_DATASET_PATH)
         df = read_csv_robust(ref_path)
         col_lower = {col: col.strip().lower() for col in df.columns}
         def pick(*names):
@@ -2691,7 +785,7 @@ def load_reference_dataset(dataset_path: Optional[str] = None):
                     if low == str(name).strip().lower() or low.replace(" ", "") in normalized_names:
                         return col
             return None
-        compound_col = pick("chemical compound", "chemical_compound", "compound", "化学品", "化学物质", "名称")
+        compound_col = pick("chemical compound", "chemical_compound", "compound")
         cas_col = pick("cas", "cas number", "CAS")
         smiles_col = pick("SMILES")
         category_col = pick("category")
@@ -2750,56 +844,8 @@ def load_reference_dataset(dataset_path: Optional[str] = None):
         return None
 
 
-def normalize_category_input(category_input):
-    """标准化类别输入（处理数字、中英文及大小写差异）。"""
-    if pd.isna(category_input):
-        return None
-    text = str(category_input).strip()
-    if text == "":
-        return None
-    # 纯数字或类似 "1" / "1.0" / "01"
-    try:
-        code_val = int(float(text))
-        if code_val in LEGACY_CATEGORY_CODES:
-            return code_val
-    except Exception:
-        pass
-    category_input = text.lower()
-    # 中英文名称映射
-    if "烷" in category_input or "alkane" in category_input:
-        return 0
-    elif "醇" in category_input and "二醇" not in category_input or "alcohol" in category_input and "diol" not in category_input:
-        return 1
-    elif "二醇" in category_input or "diol" in category_input:
-        return 2
-    elif "醚" in category_input or "ether" in category_input:
-        return 3
-    elif "酮" in category_input or "ketone" in category_input:
-        return 4
-    elif "醛" in category_input or "aldehyde" in category_input:
-        return 5
-    elif "酯" in category_input or "ester" in category_input:
-        return 6
-    elif "羧酸" in category_input and "二元" not in category_input or "carboxyl" in category_input and "dicarboxylic" not in category_input:
-        return 7
-    elif "二元羧酸" in category_input or "dicarboxylic" in category_input:
-        return 8
-    elif "卤" in category_input or "halogen" in category_input:
-        return 9
-    elif "硫化物" in category_input or "disulfide" in category_input:
-        return 10
-    elif "烯" in category_input or "alkene" in category_input:
-        return 11
-    elif "苯" in category_input or "benzene" in category_input:
-        return 12
-    elif "酚" in category_input or "phenol" in category_input:
-        return 13
-    else:
-        return 14
-
-
 def find_compound_record(name, df):
-    """在参考数据集中查找与化学物质名称匹配的记录。"""
+    """Find a reference record matching the supplied chemical name."""
     if df is None or not name:
         return None
     name_norm = str(name).strip().lower()
@@ -2809,14 +855,13 @@ def find_compound_record(name, df):
     if hit.empty:
         return None
     row = hit.iloc[0]
-    category_code = normalize_category_input(row.get("category")) if "category" in row else None
     category27_info = locked_category_info(
         row.get("category27_label"),
         str(row.get("category27_reason") or "Loaded from the reference dataset."),
         "reference_dataset",
     )
 
-    # 参考数据集中若包含 FP_1..FP_4096，则可直接使用，避免依赖外部网络查询SMILES。
+
     fp_pairs = []
     for col in row.index:
         m = re.fullmatch(r"fp[_\s-]*(\d+)", str(col).strip().lower())
@@ -2841,7 +886,6 @@ def find_compound_record(name, df):
     return {
         "cas": row.get("cas"),
         "smiles": row.get("smiles"),
-        "category_code": category_code,
         "fingerprint": fp_vec,
         "category27_info": category27_info,
     }
@@ -3655,19 +1699,6 @@ def inject_custom_styles():
     )
 
 
-def render_section_heading(kicker: str, title: str, description: str):
-    st.markdown(
-        f"""
-        <div class="section-shell">
-            <div class="section-kicker">{escape(kicker)}</div>
-            <h2 class="section-title">{escape(title)}</h2>
-            <div class="section-desc">{escape(description)}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
 def render_hero(dataset_ready: bool):
     st.markdown(
         """
@@ -3691,21 +1722,6 @@ def render_hero(dataset_ready: bool):
     )
 
 
-def render_feature_cards(cards: List[Dict[str, str]]):
-    cols = st.columns(len(cards))
-    for col, card in zip(cols, cards):
-        with col:
-            st.markdown(
-                f"""
-                <div class="feature-card">
-                    <div class="feature-icon">{escape(card['kicker'])}</div>
-                    <div class="feature-title">{escape(card['title'])}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-
 def render_pipeline_board(step_events: List[Dict[str, str]]):
     base_steps = [
         (1, "Compound Query", "Input compound name and pH."),
@@ -3714,7 +1730,7 @@ def render_pipeline_board(step_events: List[Dict[str, str]]):
         (4, "Class Assignment", "Assign the reaction class automatically."),
         (5, "Fingerprint Encoding", "Build the Morgan fingerprint."),
         (6, "logk Prediction", "Return the final rate constant."),
-        (7, "Prediction Range", "Judge whether the compound is covered by the high-throughput prediction range."),
+        (7, "Prediction Range", "Assess the compound's applicability domain against the training data."),
     ]
     event_map = {int(item.get("index", 0)): item for item in step_events if item.get("index")}
     cols = st.columns(len(base_steps), gap="small")
@@ -3776,38 +1792,6 @@ def render_detail_card(title: str, rows: List[Tuple[str, str]]):
             st.markdown(f"<p style='font-size: 16pt; margin: 0.5rem 0; font-family: Times New Roman;'>{display_value}</p>", unsafe_allow_html=True)
 
 
-def render_insight_card(label: str, value: str, description: str):
-    st.markdown(
-        f"""
-        <div class="insight-card">
-            <div class="insight-label">{escape(label)}</div>
-            <div class="insight-value">{escape(value)}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def render_step_timeline(step_events: List[Dict[str, str]]):
-    if not step_events:
-        return
-    for item in step_events:
-        tone = item.get("tone", "info")
-        st.markdown(
-            f"""
-            <div class="step-card {escape(tone)}">
-                <div class="step-header">
-                    <div>
-                        <div class="step-title">{escape(item.get('title', ''))}</div>
-                    </div>
-                    <span class="step-state {escape(tone)}">{escape(item.get('state', tone))}</span>
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-
 def render_alert_banner(message: str, tone: str = "error"):
     st.markdown(
         f"""
@@ -3839,7 +1823,7 @@ def render_prediction_range_card(detail: Dict[str, object]):
                         line-height: 1.2;
                         margin-bottom: 0.5rem;
                         font-family: 'Times New Roman', Times, serif;">
-                High-throughput Prediction Range
+                Prediction Applicability Domain
             </div>
             <div style="font-size: 18pt;
                         font-weight: 800;
@@ -3851,27 +1835,6 @@ def render_prediction_range_card(detail: Dict[str, object]):
         """,
         unsafe_allow_html=True,
     )
-
-
-def family12_reason_for_display(info: Optional[Dict[str, str]]) -> str:
-    if not info:
-        return "Not available."
-    if info.get("reason_raw"):
-        return str(info.get("reason_raw"))
-    source = str(info.get("source", "")).strip().lower()
-    if source == "uploaded_dataset":
-        return "Loaded from the uploaded dataset."
-    if source == "reference_dataset":
-        return "Loaded from the reference dataset."
-    return "Family12 assignment completed."
-
-
-def family12_label_for_display(info: Optional[Dict[str, str]]) -> str:
-    if not info:
-        return "Not assigned"
-    code = str(info.get("code", "")).strip()
-    name_en = str(info.get("name_en", info.get("name_cn", ""))).strip()
-    return f"{code} | {name_en}" if code else name_en
 
 
 def category27_reason_for_display(info: Optional[Dict[str, str]]) -> str:
@@ -3896,25 +1859,20 @@ def category27_label_for_display(info: Optional[Dict[str, str]]) -> str:
     return f"{code}: {name}".strip(": ").strip() if (code or name) else "Not assigned"
 
 
-# ======================== Streamlit主界面构建 ========================
 def main():
     st.set_page_config(page_title="Reaction Rate Constant Prediction Workflow", page_icon="📄", layout="wide")
     inject_custom_styles()
 
-    latest_v9_model, latest_v9_params, latest_v9_dataset, latest_v9_summary = _find_locked_v9_artifacts()
-    transformer_model_path = latest_v9_model
-    transformer_params_path = latest_v9_params
-    transformer_summary_path = latest_v9_summary
-    reference_dataset_path = latest_v9_dataset or DATASET_PATH
+    reference_dataset_path = str(RUNTIME_DATASET_PATH)
 
     render_hero(dataset_ready=os.path.exists(reference_dataset_path))
     if not os.path.exists(reference_dataset_path):
         render_alert_banner(
-            "The validated reference dataset is not available. Restore the dataset path before running the publication workflow.",
+            "The reference dataset is unavailable. Restore the dataset before running a prediction.",
             tone="error",
         )
 
-    # 横向布局：输入 -> 处理 -> 结果
+
     main_cols = st.columns([1.05, 1.3, 1.25], gap="large", vertical_alignment="top")
 
     with main_cols[0]:
@@ -4062,7 +2020,7 @@ def main():
                         ✓ Prediction Range
                     </div>
                     <div style="font-size: 16pt; font-weight: bold; color: #555; font-family: 'Times New Roman', Times, serif; line-height: 1.35; margin-left: 1.5rem;">
-                        Checking high-throughput prediction range...
+                        Checking applicability domain...
                     </div>
                 </div>
                 """,
@@ -4378,13 +2336,11 @@ def main():
         )
 
         target_fp_size = FP_SIZE
-        if os.path.exists(transformer_params_path):
-            try:
-                params_payload = _load_json_file(transformer_params_path)
-                params_preview, _, _ = _extract_v9_payload_fields(params_payload)
-                target_fp_size = int(params_preview.get("fp_bits", 3147))
-            except Exception:
-                target_fp_size = 3147
+        try:
+            params_preview = _load_json_file(str(RUNTIME_CONFIG_PATH))["params"]
+            target_fp_size = int(params_preview["fp_bits"])
+        except (OSError, KeyError, TypeError, ValueError):
+            pass
 
         fp = dataset_record.get("fingerprint") if dataset_record else None
         if fp is not None and int(np.asarray(fp).reshape(-1).size) == int(target_fp_size):
@@ -4436,10 +2392,10 @@ def main():
                 )
 
         bundle, t_params, load_err = load_decat_v9_bundle(
-            model_path=transformer_model_path,
-            params_path=transformer_params_path,
+            model_path="",
+            params_path="",
             dataset_path=reference_dataset_path,
-            summary_path=transformer_summary_path,
+            summary_path="",
         )
         if bundle is None:
             step_events.append(
@@ -4488,14 +2444,14 @@ def main():
                 "message": "The prediction model completed inference and returned the final logk estimate.",
             }
         )
-        range_source = str(detail.get("high_throughput_range_source", "") or "")
+        range_source = str(detail.get("AD_source", "") or "")
         step_events.append(
             {
                 "index": 7,
                 "title": "prediction range",
-                "state": "Library match" if bool(detail.get("high_throughput_library_match", False)) else "Online assessment",
+                "state": "Online assessment",
                 "tone": "success" if str(detail.get("DECAT_AD_label", "")) == "In AD" else ("warn" if "Borderline" in str(detail.get("DECAT_AD_label", "")) else "error"),
-                "message": range_source or "The high-throughput prediction range rule was applied to this compound.",
+                "message": range_source or "Applicability was assessed against the training fingerprint space.",
             }
         )
         with prediction_range_placeholder.container():
@@ -4702,6 +2658,7 @@ def main():
             unsafe_allow_html=True,
         )
 
+
 def _running_in_streamlit():
     """Detect if stream is launched via `streamlit run`.
     Uses runtime context to avoid AttributeError on older Streamlit versions.
@@ -4713,15 +2670,12 @@ def _running_in_streamlit():
 
 
 if __name__ == "__main__":
-    # If launched via plain python, re-launch with `streamlit run` to avoid bare-mode runtime warnings.
     if not _running_in_streamlit():
         script_path = os.path.abspath(__file__)
-        print("检测到通过 python 直接运行，正在自动以 `streamlit run` 方式重新启动…")
+        print("Starting the prediction app with streamlit run...")
         try:
-            # inherit environment; don't raise to allow graceful fallback
-            subprocess.run(["streamlit", "run", script_path], check=False)
+            subprocess.run([sys.executable, "-m", "streamlit", "run", script_path], check=False)
         except FileNotFoundError:
-            print("未找到 streamlit 可执行文件，请先在当前环境安装后再试。")
+            print("Streamlit is unavailable. Install the deployment requirements first.")
         raise SystemExit(0)
     main()
-

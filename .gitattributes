@@ -1,0 +1,4 @@
+* text=auto eol=lf
+*.pth -text
+*.pkl -text
+*.xlsx -text

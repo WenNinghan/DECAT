@@ -1,5 +1,0 @@
-pandas
-numpy
-rdkit-pypi
-scikit-learn
-

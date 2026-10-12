@@ -1,68 +1,70 @@
-"""Launch locked DECAT reproduction from the package root.
-
-Patches the hardcoded PROJECT path inside run_decat_v21_blind_validation_fixed.py
-so the package is self-contained.
-"""
+"""Validate the package and launch the canonical fixed-parameter DECAT runner."""
 from __future__ import annotations
 
+import argparse
+import hashlib
+import json
 import os
+from pathlib import Path
 import runpy
 import sys
-from pathlib import Path
+
+
+def verify_package(package_root: Path, config: dict) -> None:
+    """Check required files and the fixed dataset/split contract without importing ML libraries."""
+    checks = [
+        ("data", package_root / config["data"]["path"], config["data"]["sha256"]),
+        ("split", package_root / config["split"]["path"], config["split"]["sha256"]),
+        ("runner", package_root / config["runtime"]["runner_path"], config["runtime"]["runner_sha256"]),
+        ("model source", package_root / config["runtime"]["model_source_path"], config["runtime"]["model_source_sha256"]),
+        ("base config", package_root / config["runtime"]["base_config_path"], config["runtime"]["base_config_sha256"]),
+    ]
+    for label, path, expected in checks:
+        if not path.is_file():
+            raise FileNotFoundError(f"{label} not found: {path}")
+        actual = hashlib.sha256(path.read_bytes()).hexdigest()
+        if actual != expected:
+            raise ValueError(f"{label} SHA-256 mismatch: expected {expected}, got {actual}")
+    split = json.loads(checks[1][1].read_text(encoding="utf-8-sig"))
+    if split["source_sha256"] != config["data"]["sha256"]:
+        raise ValueError("Split source SHA-256 does not match the dataset.")
+    members = [list(map(int, split[key])) for key in ("train_idx", "val_idx", "test_idx")]
+    expected_sizes = [config["split"][key] for key in ("train_n", "validation_n", "test_n")]
+    if [len(part) for part in members] != expected_sizes:
+        raise ValueError("Split sizes do not match the configuration.")
+    flattened = [index for part in members for index in part]
+    if len(flattened) != len(set(flattened)) or set(flattened) != set(range(config["data"]["row_count"])):
+        raise ValueError("Split members must be disjoint and cover every dataset row once.")
+    print("Package integrity OK.", flush=True)
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--verify-only", action="store_true", help="Validate files and split membership without training.")
+    parser.add_argument("--output-root", type=Path, help="Directory for local training outputs.")
+    args = parser.parse_args()
     package_root = Path(__file__).resolve().parents[1]
-    runner = package_root / "run_decat_v21_blind_validation_fixed.py"
-    if not runner.is_file():
-        raise FileNotFoundError(runner)
+    config_path = package_root / "configs" / "LOCKED_SEEN25_1626_NONUNIFORM_SOTA.json"
+    config = json.loads(config_path.read_text(encoding="utf-8-sig"))
+    verify_package(package_root, config)
+    if args.verify_only:
+        return
 
-    # Ensure package model code is importable.
-    src = package_root / "src"
-    sys.path.insert(0, str(src))
-    sys.path.insert(0, str(package_root))
-
-    # Force data/split/output if not already set by the PowerShell wrapper.
-    os.environ.setdefault(
-        "DECAT_DATA_PATH_OVERRIDE",
-        str(package_root / "data" / "反应logk指纹数据_25类_含环境无机物_Other_1626条.csv"),
-    )
-    os.environ.setdefault(
-        "DECAT_SPLIT_PATH_OVERRIDE",
-        str(package_root / "data" / "固定划分_1626_同分子异pH非均分_75-12.5-12.5.json"),
-    )
-    os.environ.setdefault("DECAT_CATEGORY_A_FAMILY_OVERRIDE", "other")
-    os.environ.setdefault("DECAT_STRICT_SEED", "242")
-    os.environ.setdefault("DECAT_MODEL_SEED", "242")
-    os.environ.setdefault("DECAT_PARAMETER_PROFILE", "25class_stack")
-    os.environ.setdefault("DECAT_FINAL_COMPONENT", "nn_plus_res_rf")
-    os.environ.setdefault("DECAT_UNMASK_TEST", "1")
-    os.environ.setdefault("DECAT_TEST_GUIDED", "0")
-    os.environ.setdefault("DECAT_CONDITION_INTERPOLATION", "1")
-    os.environ.setdefault("DECAT_SAVE_ARTIFACTS", "1")
-    os.environ.setdefault("DECAT_MAX_EPOCHS", "120")
-    os.environ.setdefault("DECAT_EARLY_STOP", "36")
+    for key, value in config["environment"].items():
+        os.environ.setdefault(key, str(value))
+    os.environ.setdefault("DECAT_DATA_PATH_OVERRIDE", str(package_root / config["data"]["path"]))
+    os.environ.setdefault("DECAT_SPLIT_PATH_OVERRIDE", str(package_root / config["split"]["path"]))
+    os.environ.setdefault("DECAT_PARAMS_JSON", json.dumps(config["params"]))
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
+    if args.output_root:
+        os.environ["DECAT_OUTPUT_ROOT_OVERRIDE"] = str(args.output_root.resolve())
+    else:
+        os.environ.setdefault("DECAT_OUTPUT_ROOT_OVERRIDE", str(package_root / "outputs" / "training"))
 
-    # Monkeypatch PROJECT before the runner module body uses it:
-    # load source, replace PROJECT assignment, exec.
-    source = runner.read_text(encoding="utf-8")
-    # Rewrite absolute PROJECT line to package root.
-    rewritten = []
-    for line in source.splitlines(keepends=True):
-        if line.startswith("PROJECT = Path("):
-            rewritten.append(f"PROJECT = Path(r'''{package_root}''')\n")
-        else:
-            rewritten.append(line)
-    code = compile("".join(rewritten), str(runner), "exec")
-    globals_dict = {
-        "__name__": "__main__",
-        "__file__": str(runner),
-        "__package__": None,
-    }
-    # Provide package-local src/decat to imports that use the package src layout
+    sys.path.insert(0, str(package_root / "src"))
+    sys.path.insert(0, str(package_root))
     os.chdir(package_root)
-    exec(code, globals_dict)
+    runpy.run_path(str(package_root / config["runtime"]["runner_path"]), run_name="__main__")
 
 
 if __name__ == "__main__":

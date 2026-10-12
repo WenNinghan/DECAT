@@ -10,7 +10,10 @@ env/
 .env
 .env.*
 outputs/
-**/outputs/
+results/
+model_export/
+activation-results/
+/artifacts/activation/
 *.log
 *.tmp
 *.bak

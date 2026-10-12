@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import math
 import sys
 from pathlib import Path
 
@@ -28,18 +29,13 @@ def main() -> int:
     fp = module.smiles_to_fingerprint("CCO", fp_size=int(bundle["fp_bits"]))
     category = module.classify_category27_from_smiles("CCO")
     prediction, detail = module.predict_with_decat_v9(bundle, fp, 7.0, category, "CCO")
-    if prediction != prediction:
-        raise RuntimeError("Prediction is NaN")
-
-    library = module.load_builtin_high_throughput_results()
-    if library is None or len(library) != 4295:
-        raise RuntimeError("The bundled 4,295-structure screening result is missing or incomplete")
+    if not math.isfinite(float(prediction)):
+        raise RuntimeError("Prediction is not finite")
 
     print("Deployment verification PASSED")
     print(f"release={release}")
     print(f"prediction_CCO={float(prediction):.8f}")
     print(f"ad_label_CCO={detail.get('DECAT_AD_label')}")
-    print(f"library_rows={len(library)}")
     return 0
 
 
